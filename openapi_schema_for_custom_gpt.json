@@ -1,0 +1,175 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "RIGA Direct Trade Backend",
+    "version": "4.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://two7-hqhd.onrender.com"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "operationId": "checkHealth",
+        "summary": "Check health",
+        "responses": {
+          "200": {
+            "description": "OK"
+          }
+        }
+      }
+    },
+    "/ltp": {
+      "get": {
+        "operationId": "getLtp",
+        "summary": "Get LTP",
+        "parameters": [
+          {
+            "name": "exchange",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tradingsymbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "symboltoken",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "LTP"
+          }
+        }
+      }
+    },
+    "/direct-trade-signal": {
+      "get": {
+        "operationId": "getDirectTradeSignal",
+        "summary": "Get direct BUY/SELL/NO TRADE signal",
+        "parameters": [
+          {
+            "name": "exchange",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tradingsymbol",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "symboltoken",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Direct trade signal"
+          }
+        }
+      }
+    },
+    "/direct-trade-scan": {
+      "get": {
+        "operationId": "directTradeScan",
+        "summary": "Scan default watchlist for direct trades",
+        "responses": {
+          "200": {
+            "description": "Direct trade scan"
+          }
+        }
+      }
+    },
+    "/direct-trade-custom-scan": {
+      "post": {
+        "operationId": "directTradeCustomScan",
+        "summary": "Scan custom watchlist for direct trades",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "exchange": {
+                      "type": "string"
+                    },
+                    "tradingsymbol": {
+                      "type": "string"
+                    },
+                    "symboltoken": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "exchange",
+                    "tradingsymbol",
+                    "symboltoken"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Custom direct trade scan"
+          }
+        }
+      }
+    },
+    "/option-chain-status": {
+      "get": {
+        "operationId": "getOptionChainStatus",
+        "summary": "Option chain status",
+        "responses": {
+          "200": {
+            "description": "Status"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {},
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ]
+}
