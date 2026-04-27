@@ -10,7 +10,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA SNIPER v6", version="6.0")
+app = FastAPI(title="RIGA v7 FINAL SNIPER", version="7.0")
 
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
 ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
@@ -55,11 +55,13 @@ def check_token(authorization: Optional[str], token: Optional[str]):
     if not RIGA_ACTION_TOKEN:
         return
 
-    header_ok = authorization == f"Bearer {RIGA_ACTION_TOKEN}"
-    query_ok = token == RIGA_ACTION_TOKEN
+    if authorization == f"Bearer {RIGA_ACTION_TOKEN}":
+        return
 
-    if not header_ok and not query_ok:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if token == RIGA_ACTION_TOKEN:
+        return
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def get_client():
@@ -95,6 +97,7 @@ def load_scrip_master():
 
     res = requests.get(SCRIP_MASTER_URL, timeout=25)
     res.raise_for_status()
+
     scrip_master_cache = res.json()
     return scrip_master_cache
 
@@ -106,13 +109,13 @@ def get_ltp(client, item):
             item["tradingsymbol"],
             str(item["symboltoken"])
         )
-    except Exception as e:
+    except Exception:
         return None
 
     if not res or not res.get("status"):
         return None
 
-    d = res["data"]
+    d = res.get("data", {})
 
     return {
         "symbol": item["tradingsymbol"],
@@ -126,23 +129,51 @@ def get_ltp(client, item):
     }
 
 
-def candle_quality(data):
+def safe_num(value):
+    return isinstance(value, (int, float))
+
+
+def candle_stats(data):
     high = data.get("high")
     low = data.get("low")
     ltp = data.get("ltp")
     open_p = data.get("open")
 
-    if not all(isinstance(x, (int, float)) for x in [high, low, ltp, open_p]):
-        return "BAD", 0
+    if not all(safe_num(x) for x in [high, low, ltp, open_p]):
+        return None
 
     rng = high - low
     if rng <= 0:
-        return "BAD", 0
+        return None
 
     body = abs(ltp - open_p)
+    upper_wick = high - max(open_p, ltp)
+    lower_wick = min(open_p, ltp) - low
+    position = (ltp - low) / rng
+    momentum = ((ltp - open_p) / open_p) * 100 if open_p else 0
     strength = body / rng
 
-    if strength >= 0.65:
+    return {
+        "range": rng,
+        "body": body,
+        "upper_wick": upper_wick,
+        "lower_wick": lower_wick,
+        "position": position,
+        "momentum": momentum,
+        "strength": strength
+    }
+
+
+def candle_quality(data):
+    st = candle_stats(data)
+    if not st:
+        return "BAD", 0
+
+    strength = st["strength"]
+
+    if strength >= 0.70:
+        return "A_PLUS", strength
+    if strength >= 0.60:
         return "A_GRADE", strength
     if strength >= 0.45:
         return "B_GRADE", strength
@@ -151,63 +182,80 @@ def candle_quality(data):
 
 
 def detect_pattern(data):
-    high = data.get("high")
-    low = data.get("low")
-    ltp = data.get("ltp")
-    open_p = data.get("open")
-
-    if not all(isinstance(x, (int, float)) for x in [high, low, ltp, open_p]):
+    st = candle_stats(data)
+    if not st:
         return "NO_PATTERN"
 
-    rng = high - low
-    if rng <= 0:
-        return "NO_PATTERN"
+    pos = st["position"]
+    mom = st["momentum"]
+    strength = st["strength"]
 
-    position = (ltp - low) / rng
-    momentum = ((ltp - open_p) / open_p) * 100 if open_p else 0
-
-    if position > 0.85 and momentum > 0.70:
+    if pos > 0.88 and mom > 0.75 and strength >= 0.60:
         return "BULLISH_BREAKOUT"
 
-    if position < 0.15 and momentum < -0.70:
+    if pos < 0.12 and mom < -0.75 and strength >= 0.60:
         return "BEARISH_BREAKDOWN"
 
-    if position > 0.70 and momentum > 0.35:
+    if pos > 0.72 and mom > 0.40 and strength >= 0.45:
         return "BULLISH_CONTINUATION"
 
-    if position < 0.30 and momentum < -0.35:
+    if pos < 0.28 and mom < -0.40 and strength >= 0.45:
         return "BEARISH_CONTINUATION"
 
     return "NO_PATTERN"
 
 
-def fake_breakout_filter(data):
-    high = data.get("high")
-    low = data.get("low")
-    ltp = data.get("ltp")
-    open_p = data.get("open")
+def liquidity_trap_filter(data):
+    st = candle_stats(data)
+    if not st:
+        return True, "bad candle data"
 
-    if not all(isinstance(x, (int, float)) for x in [high, low, ltp, open_p]):
+    body = st["body"]
+    upper_wick = st["upper_wick"]
+    lower_wick = st["lower_wick"]
+    pos = st["position"]
+
+    if body <= 0:
+        return True, "doji/no body trap"
+
+    if upper_wick > body * 1.7 and pos < 0.75:
+        return True, "upper wick rejection trap"
+
+    if lower_wick > body * 1.7 and pos > 0.25:
+        return True, "lower wick rejection trap"
+
+    return False, "no liquidity trap"
+
+
+def retest_filter(data, pattern):
+    st = candle_stats(data)
+    if not st:
+        return False, "no retest data"
+
+    pos = st["position"]
+
+    # With only OHLC/LTP, this is an approximation:
+    # strong close after moving away from low/high means accepted retest.
+    if pattern in ["BULLISH_BREAKOUT", "BULLISH_CONTINUATION"]:
+        if pos >= 0.78:
+            return True, "bullish acceptance/retest approximation"
+
+    if pattern in ["BEARISH_BREAKDOWN", "BEARISH_CONTINUATION"]:
+        if pos <= 0.22:
+            return True, "bearish acceptance/retest approximation"
+
+    return False, "retest not confirmed"
+
+
+def option_alignment(option_type, side):
+    if option_type == "CE" and side == "BUY":
         return True
-
-    rng = high - low
-    if rng <= 0:
+    if option_type == "PE" and side == "SELL":
         return True
-
-    upper_wick = high - max(open_p, ltp)
-    lower_wick = min(open_p, ltp) - low
-    body = abs(ltp - open_p)
-
-    if upper_wick > body * 1.5 and ltp < high:
-        return True
-
-    if lower_wick > body * 1.5 and ltp > low:
-        return True
-
     return False
 
 
-def riga_sniper_logic(data, option_type=None):
+def riga_v7_logic(data, option_type=None):
     if not data:
         return {
             "bias": "NO TRADE",
@@ -215,83 +263,104 @@ def riga_sniper_logic(data, option_type=None):
             "reason": "No data"
         }
 
-    ltp = data.get("ltp")
-    high = data.get("high")
-    low = data.get("low")
-    open_p = data.get("open")
-
-    if not all(isinstance(x, (int, float)) for x in [ltp, high, low, open_p]):
+    st = candle_stats(data)
+    if not st:
         return {
             "bias": "NO TRADE",
             "confidence": 0,
-            "reason": "Invalid data"
+            "reason": "Invalid OHLC data"
         }
-
-    rng = high - low
-    if rng <= 0:
-        return {
-            "bias": "NO TRADE",
-            "confidence": 0,
-            "reason": "Invalid range"
-        }
-
-    position = (ltp - low) / rng
-    momentum = ((ltp - open_p) / open_p) * 100 if open_p else 0
 
     pattern = detect_pattern(data)
     candle, strength = candle_quality(data)
-    fake = fake_breakout_filter(data)
+    trap, trap_reason = liquidity_trap_filter(data)
+    retest, retest_reason = retest_filter(data, pattern)
+
+    momentum = st["momentum"]
+    position = st["position"]
+    rng = st["range"]
+    ltp = data["ltp"]
 
     buy_score = 0
     sell_score = 0
-    reasons = []
+    buy_reasons = []
+    sell_reasons = []
 
-    if pattern in ["BULLISH_BREAKOUT", "BULLISH_CONTINUATION"]:
+    if pattern == "BULLISH_BREAKOUT":
         buy_score += 30
-        reasons.append(pattern)
+        buy_reasons.append("bullish breakout")
+    elif pattern == "BULLISH_CONTINUATION":
+        buy_score += 20
+        buy_reasons.append("bullish continuation")
 
-    if pattern in ["BEARISH_BREAKDOWN", "BEARISH_CONTINUATION"]:
+    if pattern == "BEARISH_BREAKDOWN":
         sell_score += 30
-        reasons.append(pattern)
+        sell_reasons.append("bearish breakdown")
+    elif pattern == "BEARISH_CONTINUATION":
+        sell_score += 20
+        sell_reasons.append("bearish continuation")
 
-    if candle == "A_GRADE":
+    if candle == "A_PLUS":
         buy_score += 20
         sell_score += 20
-        reasons.append("A grade candle")
+        buy_reasons.append("A+ candle")
+        sell_reasons.append("A+ candle")
+    elif candle == "A_GRADE":
+        buy_score += 15
+        sell_score += 15
+        buy_reasons.append("A grade candle")
+        sell_reasons.append("A grade candle")
     elif candle == "B_GRADE":
-        buy_score += 10
-        sell_score += 10
-        reasons.append("B grade candle")
+        buy_score += 8
+        sell_score += 8
+        buy_reasons.append("B grade candle")
+        sell_reasons.append("B grade candle")
 
-    if momentum > 0.70:
+    if momentum > 0.75:
         buy_score += 20
-        reasons.append("strong bullish momentum")
+        buy_reasons.append("strong bullish momentum")
 
-    if momentum < -0.70:
+    if momentum < -0.75:
         sell_score += 20
-        reasons.append("strong bearish momentum")
+        sell_reasons.append("strong bearish momentum")
 
     if position > 0.85:
         buy_score += 15
-        reasons.append("near day high")
+        buy_reasons.append("price near day high")
 
     if position < 0.15:
         sell_score += 15
-        reasons.append("near day low")
+        sell_reasons.append("price near day low")
 
-    if fake:
+    if retest:
+        if pattern in ["BULLISH_BREAKOUT", "BULLISH_CONTINUATION"]:
+            buy_score += 10
+            buy_reasons.append(retest_reason)
+        if pattern in ["BEARISH_BREAKDOWN", "BEARISH_CONTINUATION"]:
+            sell_score += 10
+            sell_reasons.append(retest_reason)
+
+    if trap:
         buy_score -= 25
         sell_score -= 25
-        reasons.append("fake breakout risk")
+        buy_reasons.append(trap_reason)
+        sell_reasons.append(trap_reason)
 
-    # Option logic alignment:
-    # CE should prefer BUY, PE should prefer SELL.
+    # CE/PE alignment
     if option_type == "CE":
-        sell_score -= 20
+        sell_score -= 25
     if option_type == "PE":
-        buy_score -= 20
+        buy_score -= 25
 
+    # BUY
     if buy_score >= 70 and buy_score >= sell_score:
+        if option_type and not option_alignment(option_type, "BUY"):
+            return {
+                "bias": "NO TRADE",
+                "confidence": buy_score,
+                "reason": "Option type not aligned with BUY"
+            }
+
         sl = round(ltp - rng * 0.20, 2)
         target = round(ltp + (ltp - sl) * 2, 2)
 
@@ -300,14 +369,24 @@ def riga_sniper_logic(data, option_type=None):
             "entry": round(ltp, 2),
             "sl": sl,
             "target": target,
-            "confidence": min(buy_score, 90),
+            "confidence": min(buy_score, 95),
             "pattern": pattern,
             "candle": candle,
             "candle_strength": round(strength, 2),
-            "reason": ", ".join(reasons)
+            "retest": retest,
+            "trap_filter": trap_reason,
+            "reason": ", ".join(buy_reasons)
         }
 
+    # SELL
     if sell_score >= 70 and sell_score > buy_score:
+        if option_type and not option_alignment(option_type, "SELL"):
+            return {
+                "bias": "NO TRADE",
+                "confidence": sell_score,
+                "reason": "Option type not aligned with SELL"
+            }
+
         sl = round(ltp + rng * 0.20, 2)
         target = round(ltp - (sl - ltp) * 2, 2)
 
@@ -316,11 +395,13 @@ def riga_sniper_logic(data, option_type=None):
             "entry": round(ltp, 2),
             "sl": sl,
             "target": target,
-            "confidence": min(sell_score, 90),
+            "confidence": min(sell_score, 95),
             "pattern": pattern,
             "candle": candle,
             "candle_strength": round(strength, 2),
-            "reason": ", ".join(reasons)
+            "retest": retest,
+            "trap_filter": trap_reason,
+            "reason": ", ".join(sell_reasons)
         }
 
     return {
@@ -329,7 +410,9 @@ def riga_sniper_logic(data, option_type=None):
         "pattern": pattern,
         "candle": candle,
         "candle_strength": round(strength, 2),
-        "reason": "RIGA sniper confirmations below 70"
+        "retest": retest,
+        "trap_filter": trap_reason,
+        "reason": "RIGA v7 confirmations below 70"
     }
 
 
@@ -341,7 +424,7 @@ def parse_expiry(expiry):
     for fmt in ("%d%b%Y", "%d%b%y"):
         try:
             return datetime.strptime(str(expiry).upper(), fmt)
-        except:
+        except Exception:
             pass
     return None
 
@@ -350,7 +433,10 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
     index_name = index_name.upper()
 
     if index_name not in INDEX_CONFIG:
-        raise HTTPException(status_code=400, detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX")
+        raise HTTPException(
+            status_code=400,
+            detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX"
+        )
 
     cfg = INDEX_CONFIG[index_name]
     master = load_scrip_master()
@@ -395,7 +481,7 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
                 "expiry_dt": expiry_dt
             })
 
-        except:
+        except Exception:
             continue
 
     if not found:
@@ -412,16 +498,29 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
     return atm, nearest.strftime("%d%b%Y").upper(), options
 
 
+def select_best_trade(trades):
+    if not trades:
+        return None
+
+    return sorted(
+        trades,
+        key=lambda x: x["signal"].get("confidence", 0),
+        reverse=True
+    )[0]
+
+
 @app.get("/")
 def root():
     return {
-        "status": "RIGA SNIPER v6 LIVE",
+        "status": "RIGA v7 FINAL LIVE",
         "features": [
-            "auto ATM strike",
-            "option chain scan",
-            "pattern filter",
-            "candlestick filter",
-            "fake breakout filter",
+            "clean best trade output",
+            "auto ATM option chain",
+            "retest filter",
+            "liquidity trap filter",
+            "candlestick grading",
+            "pattern confirmation",
+            "CE/PE alignment",
             "70 confidence rule"
         ]
     }
@@ -441,11 +540,10 @@ def spot(
     check_token(authorization, token)
 
     index = index.upper()
-    client = get_client()
-
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
 
+    client = get_client()
     return get_ltp(client, INDEX_CONFIG[index]["spot"])
 
 
@@ -459,8 +557,10 @@ def option_chain(
     check_token(authorization, token)
 
     index = index.upper()
-    client = get_client()
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
 
+    client = get_client()
     spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
 
     if not spot_data:
@@ -492,8 +592,10 @@ def scan_options(
     check_token(authorization, token)
 
     index = index.upper()
-    client = get_client()
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
 
+    client = get_client()
     spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
 
     if not spot_data:
@@ -505,33 +607,32 @@ def scan_options(
         strikes_around
     )
 
-    results = []
+    trades = []
+    scanned = 0
 
     for opt in options:
         data = get_ltp(client, opt)
-        signal = riga_sniper_logic(data, opt.get("type"))
+        signal = riga_v7_logic(data, opt.get("type"))
+        scanned += 1
 
-        results.append({
-            "option": opt,
-            "data": data,
-            "signal": signal
-        })
+        if signal.get("bias") in ["BUY", "SELL"] and signal.get("confidence", 0) >= 70:
+            trades.append({
+                "option": opt,
+                "data": data,
+                "signal": signal
+            })
 
-    trades = [
-        x for x in results
-        if x["signal"].get("bias") in ["BUY", "SELL"]
-        and x["signal"].get("confidence", 0) >= 70
-    ]
+    best_trade = select_best_trade(trades)
 
     return {
         "index": index,
         "spot_ltp": spot_data["ltp"],
         "atm": atm,
         "nearest_expiry": expiry,
-        "total_options_scanned": len(results),
+        "total_options_scanned": scanned,
         "trade_count": len(trades),
-        "trades": trades,
-        "all_results": results
+        "best_trade": best_trade if best_trade else "NO TRADE",
+        "trades": trades[:5]
     }
 
 
@@ -544,6 +645,7 @@ def scan_all_options(
     check_token(authorization, token)
 
     output = {}
+    overall_trades = []
 
     for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
         try:
@@ -560,34 +662,42 @@ def scan_all_options(
                 strikes_around
             )
 
-            results = []
+            trades = []
+            scanned = 0
 
             for opt in options:
                 data = get_ltp(client, opt)
-                signal = riga_sniper_logic(data, opt.get("type"))
+                signal = riga_v7_logic(data, opt.get("type"))
+                scanned += 1
 
-                results.append({
-                    "option": opt,
-                    "data": data,
-                    "signal": signal
-                })
+                if signal.get("bias") in ["BUY", "SELL"] and signal.get("confidence", 0) >= 70:
+                    trade_obj = {
+                        "index": idx,
+                        "option": opt,
+                        "data": data,
+                        "signal": signal
+                    }
+                    trades.append(trade_obj)
+                    overall_trades.append(trade_obj)
 
-            trades = [
-                x for x in results
-                if x["signal"].get("bias") in ["BUY", "SELL"]
-                and x["signal"].get("confidence", 0) >= 70
-            ]
+            best_trade = select_best_trade(trades)
 
             output[idx] = {
                 "spot_ltp": spot_data["ltp"],
                 "atm": atm,
                 "expiry": expiry,
+                "total_options_scanned": scanned,
                 "trade_count": len(trades),
-                "trades": trades,
-                "total_options_scanned": len(results)
+                "best_trade": best_trade if best_trade else "NO TRADE",
+                "trades": trades[:3]
             }
 
         except Exception as e:
             output[idx] = {"error": str(e)}
 
-    return output
+    overall_best = select_best_trade(overall_trades)
+
+    return {
+        "overall_best_trade": overall_best if overall_best else "NO TRADE",
+        "markets": output
+    }
