@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 import pyotp
@@ -10,7 +10,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA OPTION SNIPER ENGINE", version="3.0")
+app = FastAPI(title="RIGA SNIPER v6", version="6.0")
 
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
 ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
@@ -100,11 +100,14 @@ def load_scrip_master():
 
 
 def get_ltp(client, item):
-    res = client.ltpData(
-        item["exchange"],
-        item["tradingsymbol"],
-        str(item["symboltoken"])
-    )
+    try:
+        res = client.ltpData(
+            item["exchange"],
+            item["tradingsymbol"],
+            str(item["symboltoken"])
+        )
+    except Exception as e:
+        return None
 
     if not res or not res.get("status"):
         return None
@@ -123,9 +126,94 @@ def get_ltp(client, item):
     }
 
 
-def riga_logic(data):
+def candle_quality(data):
+    high = data.get("high")
+    low = data.get("low")
+    ltp = data.get("ltp")
+    open_p = data.get("open")
+
+    if not all(isinstance(x, (int, float)) for x in [high, low, ltp, open_p]):
+        return "BAD", 0
+
+    rng = high - low
+    if rng <= 0:
+        return "BAD", 0
+
+    body = abs(ltp - open_p)
+    strength = body / rng
+
+    if strength >= 0.65:
+        return "A_GRADE", strength
+    if strength >= 0.45:
+        return "B_GRADE", strength
+
+    return "LOW_QUALITY", strength
+
+
+def detect_pattern(data):
+    high = data.get("high")
+    low = data.get("low")
+    ltp = data.get("ltp")
+    open_p = data.get("open")
+
+    if not all(isinstance(x, (int, float)) for x in [high, low, ltp, open_p]):
+        return "NO_PATTERN"
+
+    rng = high - low
+    if rng <= 0:
+        return "NO_PATTERN"
+
+    position = (ltp - low) / rng
+    momentum = ((ltp - open_p) / open_p) * 100 if open_p else 0
+
+    if position > 0.85 and momentum > 0.70:
+        return "BULLISH_BREAKOUT"
+
+    if position < 0.15 and momentum < -0.70:
+        return "BEARISH_BREAKDOWN"
+
+    if position > 0.70 and momentum > 0.35:
+        return "BULLISH_CONTINUATION"
+
+    if position < 0.30 and momentum < -0.35:
+        return "BEARISH_CONTINUATION"
+
+    return "NO_PATTERN"
+
+
+def fake_breakout_filter(data):
+    high = data.get("high")
+    low = data.get("low")
+    ltp = data.get("ltp")
+    open_p = data.get("open")
+
+    if not all(isinstance(x, (int, float)) for x in [high, low, ltp, open_p]):
+        return True
+
+    rng = high - low
+    if rng <= 0:
+        return True
+
+    upper_wick = high - max(open_p, ltp)
+    lower_wick = min(open_p, ltp) - low
+    body = abs(ltp - open_p)
+
+    if upper_wick > body * 1.5 and ltp < high:
+        return True
+
+    if lower_wick > body * 1.5 and ltp > low:
+        return True
+
+    return False
+
+
+def riga_sniper_logic(data, option_type=None):
     if not data:
-        return {"bias": "NO TRADE", "confidence": 0, "reason": "No data"}
+        return {
+            "bias": "NO TRADE",
+            "confidence": 0,
+            "reason": "No data"
+        }
 
     ltp = data.get("ltp")
     high = data.get("high")
@@ -133,40 +221,116 @@ def riga_logic(data):
     open_p = data.get("open")
 
     if not all(isinstance(x, (int, float)) for x in [ltp, high, low, open_p]):
-        return {"bias": "NO TRADE", "confidence": 0, "reason": "Invalid data"}
+        return {
+            "bias": "NO TRADE",
+            "confidence": 0,
+            "reason": "Invalid data"
+        }
 
     rng = high - low
     if rng <= 0:
-        return {"bias": "NO TRADE", "confidence": 0, "reason": "Invalid range"}
+        return {
+            "bias": "NO TRADE",
+            "confidence": 0,
+            "reason": "Invalid range"
+        }
 
-    pos = (ltp - low) / rng
-    mom = ((ltp - open_p) / open_p) * 100 if open_p else 0
+    position = (ltp - low) / rng
+    momentum = ((ltp - open_p) / open_p) * 100 if open_p else 0
 
-    if pos > 0.85 and mom > 0.70:
+    pattern = detect_pattern(data)
+    candle, strength = candle_quality(data)
+    fake = fake_breakout_filter(data)
+
+    buy_score = 0
+    sell_score = 0
+    reasons = []
+
+    if pattern in ["BULLISH_BREAKOUT", "BULLISH_CONTINUATION"]:
+        buy_score += 30
+        reasons.append(pattern)
+
+    if pattern in ["BEARISH_BREAKDOWN", "BEARISH_CONTINUATION"]:
+        sell_score += 30
+        reasons.append(pattern)
+
+    if candle == "A_GRADE":
+        buy_score += 20
+        sell_score += 20
+        reasons.append("A grade candle")
+    elif candle == "B_GRADE":
+        buy_score += 10
+        sell_score += 10
+        reasons.append("B grade candle")
+
+    if momentum > 0.70:
+        buy_score += 20
+        reasons.append("strong bullish momentum")
+
+    if momentum < -0.70:
+        sell_score += 20
+        reasons.append("strong bearish momentum")
+
+    if position > 0.85:
+        buy_score += 15
+        reasons.append("near day high")
+
+    if position < 0.15:
+        sell_score += 15
+        reasons.append("near day low")
+
+    if fake:
+        buy_score -= 25
+        sell_score -= 25
+        reasons.append("fake breakout risk")
+
+    # Option logic alignment:
+    # CE should prefer BUY, PE should prefer SELL.
+    if option_type == "CE":
+        sell_score -= 20
+    if option_type == "PE":
+        buy_score -= 20
+
+    if buy_score >= 70 and buy_score >= sell_score:
         sl = round(ltp - rng * 0.20, 2)
         target = round(ltp + (ltp - sl) * 2, 2)
+
         return {
             "bias": "BUY",
             "entry": round(ltp, 2),
             "sl": sl,
             "target": target,
-            "confidence": 70,
-            "reason": "Strong momentum near high"
+            "confidence": min(buy_score, 90),
+            "pattern": pattern,
+            "candle": candle,
+            "candle_strength": round(strength, 2),
+            "reason": ", ".join(reasons)
         }
 
-    if pos < 0.15 and mom < -0.70:
+    if sell_score >= 70 and sell_score > buy_score:
         sl = round(ltp + rng * 0.20, 2)
         target = round(ltp - (sl - ltp) * 2, 2)
+
         return {
             "bias": "SELL",
             "entry": round(ltp, 2),
             "sl": sl,
             "target": target,
-            "confidence": 70,
-            "reason": "Strong momentum near low"
+            "confidence": min(sell_score, 90),
+            "pattern": pattern,
+            "candle": candle,
+            "candle_strength": round(strength, 2),
+            "reason": ", ".join(reasons)
         }
 
-    return {"bias": "NO TRADE", "confidence": 50, "reason": "No 70% setup"}
+    return {
+        "bias": "NO TRADE",
+        "confidence": max(buy_score, sell_score),
+        "pattern": pattern,
+        "candle": candle,
+        "candle_strength": round(strength, 2),
+        "reason": "RIGA sniper confirmations below 70"
+    }
 
 
 def round_to_step(price, step):
@@ -251,13 +415,14 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
 @app.get("/")
 def root():
     return {
-        "status": "RIGA OPTION SNIPER LIVE",
+        "status": "RIGA SNIPER v6 LIVE",
         "features": [
             "auto ATM strike",
-            "NIFTY options",
-            "BANKNIFTY options",
-            "FINNIFTY options",
-            "SENSEX options"
+            "option chain scan",
+            "pattern filter",
+            "candlestick filter",
+            "fake breakout filter",
+            "70 confidence rule"
         ]
     }
 
@@ -344,7 +509,7 @@ def scan_options(
 
     for opt in options:
         data = get_ltp(client, opt)
-        signal = riga_logic(data)
+        signal = riga_sniper_logic(data, opt.get("type"))
 
         results.append({
             "option": opt,
@@ -399,7 +564,8 @@ def scan_all_options(
 
             for opt in options:
                 data = get_ltp(client, opt)
-                signal = riga_logic(data)
+                signal = riga_sniper_logic(data, opt.get("type"))
+
                 results.append({
                     "option": opt,
                     "data": data,
