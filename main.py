@@ -1,4 +1,6 @@
 import os
+import requests
+from datetime import datetime
 from typing import Optional, List, Dict, Any
 
 import pyotp
@@ -8,7 +10,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA REAL AI Backend", version="5.0.0")
+app = FastAPI(title="RIGA v6 Index + Options Scanner", version="6.0.0")
 
 # ENV
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
@@ -17,22 +19,20 @@ ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD")
 ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
 RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN", "")
 
-_smart_api: Optional[SmartConnect] = None
+_smart_api = None
+_scrip_master = None
 
-# WATCHLIST
+# INDEX WATCHLIST
 WATCHLIST = [
-    {"exchange": "NSE", "tradingsymbol": "SBIN-EQ", "symboltoken": "3045"},
-    {"exchange": "NSE", "tradingsymbol": "RELIANCE-EQ", "symboltoken": "2885"},
-    {"exchange": "NSE", "tradingsymbol": "TCS-EQ", "symboltoken": "11536"},
-    {"exchange": "NSE", "tradingsymbol": "INFY-EQ", "symboltoken": "1594"},
-    {"exchange": "NSE", "tradingsymbol": "HDFCBANK-EQ", "symboltoken": "1333"},
-    {"exchange": "NSE", "tradingsymbol": "ICICIBANK-EQ", "symboltoken": "4963"},
-    {"exchange": "NSE", "tradingsymbol": "AXISBANK-EQ", "symboltoken": "5900"},
+    {"exchange": "NSE", "tradingsymbol": "NIFTY 50", "symboltoken": "26000"},
+    {"exchange": "NSE", "tradingsymbol": "NIFTY BANK", "symboltoken": "26009"},
+    {"exchange": "NSE", "tradingsymbol": "NIFTY FIN SERVICE", "symboltoken": "26037"},
+    {"exchange": "BSE", "tradingsymbol": "SENSEX", "symboltoken": "1"},
 ]
 
 # AUTH
-def check_token(authorization: Optional[str]):
-    if RIGA_ACTION_TOKEN and authorization != f"Bearer {RIGA_ACTION_TOKEN}":
+def check_token(auth):
+    if RIGA_ACTION_TOKEN and auth != f"Bearer {RIGA_ACTION_TOKEN}":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # CONNECT
@@ -60,24 +60,36 @@ def get_client():
     _smart_api = client
     return client
 
+# LOAD OPTION TOKENS
+def load_scrip_master():
+    global _scrip_master
+
+    if _scrip_master:
+        return _scrip_master
+
+    url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+    res = requests.get(url)
+    _scrip_master = res.json()
+    return _scrip_master
+
 # FETCH LTP
-def fetch_ltp(client, item):
+def get_ltp(client, item):
     res = client.ltpData(item["exchange"], item["tradingsymbol"], item["symboltoken"])
 
     if not res.get("status"):
         return None
 
-    data = res["data"]
+    d = res["data"]
 
     return {
         "symbol": item["tradingsymbol"],
-        "ltp": data["ltp"],
-        "open": data["open"],
-        "high": data["high"],
-        "low": data["low"]
+        "ltp": d["ltp"],
+        "high": d["high"],
+        "low": d["low"],
+        "open": d["open"]
     }
 
-# REAL RIGA LOGIC
+# RIGA LOGIC
 def riga_logic(data):
     if not data:
         return {"bias": "NO TRADE"}
@@ -85,93 +97,90 @@ def riga_logic(data):
     ltp = data["ltp"]
     high = data["high"]
     low = data["low"]
-    open_price = data["open"]
+    open_p = data["open"]
 
-    range_ = high - low
-
-    if range_ == 0:
+    rng = high - low
+    if rng == 0:
         return {"bias": "NO TRADE"}
 
-    position = (ltp - low) / range_
-    momentum = (ltp - open_price) / open_price * 100
+    pos = (ltp - low) / rng
+    mom = (ltp - open_p) / open_p * 100
 
-    # BUY LOGIC
-    if position > 0.85 and momentum > 0.7:
-        sl = round(ltp - range_ * 0.2, 2)
+    if pos > 0.85 and mom > 0.7:
+        sl = round(ltp - rng * 0.2, 2)
         target = round(ltp + (ltp - sl) * 2, 2)
+        return {"bias": "BUY", "entry": ltp, "sl": sl, "target": target}
 
-        return {
-            "bias": "BUY",
-            "entry": ltp,
-            "sl": sl,
-            "target": target,
-            "confidence": 70,
-            "reason": "Strong momentum + near breakout high"
-        }
-
-    # SELL LOGIC
-    if position < 0.15 and momentum < -0.7:
-        sl = round(ltp + range_ * 0.2, 2)
+    if pos < 0.15 and mom < -0.7:
+        sl = round(ltp + rng * 0.2, 2)
         target = round(ltp - (sl - ltp) * 2, 2)
-
-        return {
-            "bias": "SELL",
-            "entry": ltp,
-            "sl": sl,
-            "target": target,
-            "confidence": 70,
-            "reason": "Strong breakdown + near day low"
-        }
+        return {"bias": "SELL", "entry": ltp, "sl": sl, "target": target}
 
     return {"bias": "NO TRADE"}
 
 # ROOT
 @app.get("/")
 def root():
-    return {"status": "RIGA LIVE"}
+    return {"status": "RIGA v6 LIVE"}
 
-# SIGNAL
-@app.get("/real-riga-signal")
-def real_signal(
-    exchange: str,
-    tradingsymbol: str,
-    symboltoken: str,
-    authorization: Optional[str] = Header(None)
-):
-    check_token(authorization)
-
-    client = get_client()
-
-    data = fetch_ltp(client, {
-        "exchange": exchange,
-        "tradingsymbol": tradingsymbol,
-        "symboltoken": symboltoken
-    })
-
-    result = riga_logic(data)
-
-    return result
-
-# SCAN
+# SCAN INDEX
 @app.get("/real-riga-scan")
-def real_scan(authorization: Optional[str] = Header(None)):
-    check_token(authorization)
-
+def scan(auth: Optional[str] = Header(None)):
+    check_token(auth)
     client = get_client()
 
-    results = []
+    trades = []
 
     for item in WATCHLIST:
-        data = fetch_ltp(client, item)
+        data = get_ltp(client, item)
         signal = riga_logic(data)
 
         if signal["bias"] != "NO TRADE":
-            results.append({
+            trades.append({
                 "symbol": item["tradingsymbol"],
                 **signal
             })
 
+    return {"trades": trades}
+
+# OPTION CHAIN (ATM)
+@app.get("/scan-options")
+def scan_options(index: str = "NIFTY", auth: Optional[str] = Header(None)):
+    check_token(auth)
+    client = get_client()
+
+    master = load_scrip_master()
+
+    spot = get_ltp(client, WATCHLIST[0])  # NIFTY default
+    atm = round(spot["ltp"] / 50) * 50
+
+    options = []
+
+    for s in master:
+        if index in s.get("name", "") and ("CE" in s["symbol"] or "PE" in s["symbol"]):
+            strike = int(float(s["strike"]) / 100)
+
+            if abs(strike - atm) <= 200:
+                options.append({
+                    "exchange": s["exch_seg"],
+                    "tradingsymbol": s["symbol"],
+                    "symboltoken": s["token"]
+                })
+
+    results = []
+
+    for opt in options[:20]:
+        data = get_ltp(client, opt)
+        signal = riga_logic(data)
+
+        if signal["bias"] != "NO TRADE":
+            results.append({
+                "symbol": opt["tradingsymbol"],
+                **signal
+            })
+
     return {
-        "total": len(WATCHLIST),
+        "index": index,
+        "atm": atm,
         "trades": results
     }
