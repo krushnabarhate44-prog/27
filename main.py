@@ -1,7 +1,7 @@
 import os
 import requests
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional
 
 import pyotp
 from dotenv import load_dotenv
@@ -10,7 +10,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA v8 OPTION BUYING ONLY", version="8.0")
+app = FastAPI(title="RIGA v8 OPTION BUYING SNIPER", version="8.1")
 
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
 ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
@@ -51,9 +51,6 @@ INDEX_CONFIG = {
 }
 
 
-# -----------------------------
-# Auth / Client
-# -----------------------------
 def check_token(authorization: Optional[str], token: Optional[str]):
     if not RIGA_ACTION_TOKEN:
         return
@@ -82,7 +79,7 @@ def get_client():
     session = client.generateSession(
         ANGEL_CLIENT_CODE,
         ANGEL_PASSWORD,
-        totp,
+        totp
     )
 
     if not session or not session.get("status"):
@@ -105,15 +102,12 @@ def load_scrip_master():
     return scrip_master_cache
 
 
-# -----------------------------
-# Data helpers
-# -----------------------------
-def get_ltp(client, item: Dict[str, Any]):
+def get_ltp(client, item):
     try:
         res = client.ltpData(
             item["exchange"],
             item["tradingsymbol"],
-            str(item["symboltoken"]),
+            str(item["symboltoken"])
         )
     except Exception:
         return None
@@ -121,12 +115,12 @@ def get_ltp(client, item: Dict[str, Any]):
     if not res or not res.get("status"):
         return None
 
-    d = res.get("data", {}) or {}
+    d = res.get("data", {})
 
     return {
         "symbol": item["tradingsymbol"],
         "exchange": item["exchange"],
-        "token": str(item["symboltoken"]),
+        "token": item["symboltoken"],
         "ltp": d.get("ltp"),
         "open": d.get("open"),
         "high": d.get("high"),
@@ -139,74 +133,7 @@ def safe_num(value):
     return isinstance(value, (int, float)) and value is not None
 
 
-def round_to_step(price, step):
-    return int(round(price / step) * step)
-
-
-def parse_expiry(expiry):
-    for fmt in ("%d%b%Y", "%d%b%y"):
-        try:
-            return datetime.strptime(str(expiry).upper(), fmt)
-        except Exception:
-            pass
-    return None
-
-
-def calc_change_pct(data: Dict[str, Any]) -> Optional[float]:
-    ltp = data.get("ltp") if data else None
-    close = data.get("close") if data else None
-
-    if not safe_num(ltp) or not safe_num(close) or close == 0:
-        return None
-
-    return ((ltp - close) / close) * 100
-
-
-def detect_index_bias(spot_data: Dict[str, Any], threshold_pct: float = 0.08) -> Dict[str, Any]:
-    """
-    Index bias is decided from spot LTP vs previous close.
-    Bullish index -> BUY CE side
-    Bearish index -> BUY PE side
-    Neutral/choppy -> NO TRADE
-    """
-    change_pct = calc_change_pct(spot_data)
-
-    if change_pct is None:
-        return {
-            "bias": "NEUTRAL",
-            "option_side": None,
-            "reason": "index change data unavailable",
-            "change_pct": None,
-        }
-
-    if change_pct >= threshold_pct:
-        return {
-            "bias": "BULLISH",
-            "option_side": "CE",
-            "reason": f"index bullish vs previous close ({change_pct:.2f}%)",
-            "change_pct": round(change_pct, 2),
-        }
-
-    if change_pct <= -threshold_pct:
-        return {
-            "bias": "BEARISH",
-            "option_side": "PE",
-            "reason": f"index bearish vs previous close ({change_pct:.2f}%)",
-            "change_pct": round(change_pct, 2),
-        }
-
-    return {
-        "bias": "NEUTRAL",
-        "option_side": None,
-        "reason": f"index neutral/choppy ({change_pct:.2f}%)",
-        "change_pct": round(change_pct, 2),
-    }
-
-
-# -----------------------------
-# RIGA option premium analysis
-# -----------------------------
-def candle_stats(data: Dict[str, Any]):
+def candle_stats(data):
     if not data:
         return None
 
@@ -240,7 +167,7 @@ def candle_stats(data: Dict[str, Any]):
     }
 
 
-def candle_quality(data: Dict[str, Any]):
+def candle_quality(data):
     st = candle_stats(data)
     if not st:
         return "BAD", 0
@@ -257,12 +184,7 @@ def candle_quality(data: Dict[str, Any]):
     return "LOW_QUALITY", strength
 
 
-def detect_premium_bullish_pattern(data: Dict[str, Any]):
-    """
-    OPTION BUYING ONLY:
-    For both CE buying and PE buying, option premium must show bullish behavior.
-    No premium SELL/SHORT logic is used.
-    """
+def detect_premium_pattern(data):
     st = candle_stats(data)
     if not st:
         return "NO_PATTERN"
@@ -277,13 +199,10 @@ def detect_premium_bullish_pattern(data: Dict[str, Any]):
     if pos > 0.72 and mom > 0.40 and strength >= 0.45:
         return "PREMIUM_BULLISH_CONTINUATION"
 
-    if mom > 0.25 and strength >= 0.35 and pos > 0.55:
-        return "PREMIUM_BUYING_PRESSURE"
-
     return "NO_PATTERN"
 
 
-def liquidity_trap_filter(data: Dict[str, Any]):
+def liquidity_trap_filter(data):
     st = candle_stats(data)
     if not st:
         return True, "bad candle data"
@@ -305,51 +224,144 @@ def liquidity_trap_filter(data: Dict[str, Any]):
     return False, "no liquidity trap"
 
 
-def premium_retest_or_acceptance_filter(data: Dict[str, Any], pattern: str):
-    """
-    Retest is still approximate because Angel LTP data gives only OHLC/LTP.
-    This does not force retest. It gives extra score only.
-    """
+def premium_acceptance_filter(data, pattern):
     st = candle_stats(data)
     if not st:
-        return False, "no acceptance data"
+        return False, "no premium acceptance data"
 
-    if pattern in [
-        "PREMIUM_BULLISH_BREAKOUT",
-        "PREMIUM_BULLISH_CONTINUATION",
-        "PREMIUM_BUYING_PRESSURE",
-    ] and st["position"] >= 0.65:
-        return True, "premium bullish acceptance"
+    # Option buying only: CE/PE premium must close/ltp in upper range.
+    if pattern in ["PREMIUM_BULLISH_BREAKOUT", "PREMIUM_BULLISH_CONTINUATION"]:
+        if st["position"] >= 0.72:
+            return True, "premium bullish acceptance"
 
     return False, "premium acceptance not confirmed"
 
 
-def riga_option_buy_logic(
-    data: Dict[str, Any],
-    option_type: str,
-    index_bias: Dict[str, Any],
-    min_confidence: int = 70,
-):
+def get_index_bias(spot_data, min_change_pct=0.10):
+    if not spot_data:
+        return {
+            "bias": "NEUTRAL",
+            "option_side": None,
+            "reason": "spot data missing",
+            "change_pct": 0,
+        }
+
+    ltp = spot_data.get("ltp")
+    close = spot_data.get("close")
+
+    if not safe_num(ltp) or not safe_num(close) or close == 0:
+        return {
+            "bias": "NEUTRAL",
+            "option_side": None,
+            "reason": "invalid spot close/ltp",
+            "change_pct": 0,
+        }
+
+    change_pct = round(((ltp - close) / close) * 100, 2)
+
+    if change_pct >= min_change_pct:
+        return {
+            "bias": "BULLISH",
+            "option_side": "CE",
+            "reason": f"index bullish vs previous close ({change_pct}%)",
+            "change_pct": change_pct,
+        }
+
+    if change_pct <= -min_change_pct:
+        return {
+            "bias": "BEARISH",
+            "option_side": "PE",
+            "reason": f"index bearish vs previous close ({change_pct}%)",
+            "change_pct": change_pct,
+        }
+
+    return {
+        "bias": "NEUTRAL",
+        "option_side": None,
+        "reason": f"index neutral vs previous close ({change_pct}%)",
+        "change_pct": change_pct,
+    }
+
+
+def make_buy_levels(data):
     """
-    Final output can only be:
-    - BUY_CE
-    - BUY_PE
-    - NO TRADE
+    Option buying levels.
+    SL is below option premium recent low with buffer.
+    Buffer is dynamic but capped so SL does not become unnecessarily wide.
+    """
+    st = candle_stats(data)
+    if not st:
+        return None
 
-    Conversion:
-    Bullish index -> scan CE -> BUY_CE
-    Bearish index -> scan PE -> BUY_PE
+    ltp = data.get("ltp")
+    low = data.get("low")
+    rng = st["range"]
 
-    No SELL / SHORT / option writing.
+    if not safe_num(ltp) or not safe_num(low):
+        return None
+
+    # Structure-based approximation with only OHLC:
+    # SL below day's/recent option low + small buffer.
+    buffer = max(round(ltp * 0.01, 2), round(rng * 0.03, 2), 1.0)
+    sl = round(low - buffer, 2)
+
+    risk = round(ltp - sl, 2)
+
+    # Risk guardrails: reject very tight or very wide SL.
+    min_risk = max(round(ltp * 0.01, 2), 1.0)
+    max_risk = round(ltp * 0.35, 2)
+
+    if risk <= min_risk:
+        return None
+
+    if risk > max_risk:
+        # Fallback to tighter structural SL around lower wick/open zone.
+        alt_sl = round(ltp - max_risk, 2)
+        if alt_sl < ltp:
+            sl = alt_sl
+            risk = round(ltp - sl, 2)
+        else:
+            return None
+
+    t1 = round(ltp + risk * 1.5, 2)
+    t2 = round(ltp + risk * 2.0, 2)
+    t3 = round(ltp + risk * 3.0, 2)
+
+    if not (sl < ltp < t1 < t2 < t3):
+        return None
+
+    return {
+        "entry": round(ltp, 2),
+        "sl": sl,
+        "target": t2,
+        "targets": {
+            "t1": t1,
+            "t2": t2,
+            "t3": t3,
+        },
+        "risk": risk,
+    }
+
+
+def riga_option_buy_logic(data, option_type, index_bias):
+    """
+    Final RIGA execution rule:
+    - Bullish index -> BUY CE only
+    - Bearish index -> BUY PE only
+    - No SELL/SHORT/WRITING output
     """
     if not data:
-        return {"bias": "NO TRADE", "confidence": 0, "reason": "No option premium data"}
-
-    if index_bias.get("bias") == "NEUTRAL" or not index_bias.get("option_side"):
         return {
             "bias": "NO TRADE",
             "confidence": 0,
-            "reason": index_bias.get("reason", "index neutral"),
+            "reason": "No option premium data",
+        }
+
+    if not index_bias or index_bias.get("option_side") not in ["CE", "PE"]:
+        return {
+            "bias": "NO TRADE",
+            "confidence": 0,
+            "reason": "Index bias neutral/invalid",
         }
 
     required_side = index_bias["option_side"]
@@ -357,7 +369,7 @@ def riga_option_buy_logic(
         return {
             "bias": "NO TRADE",
             "confidence": 0,
-            "reason": f"index {index_bias['bias']} requires {required_side}, skipped {option_type}",
+            "reason": f"Option side skipped; index requires {required_side}",
         }
 
     st = candle_stats(data)
@@ -368,31 +380,26 @@ def riga_option_buy_logic(
             "reason": "Invalid option OHLC data",
         }
 
-    pattern = detect_premium_bullish_pattern(data)
+    pattern = detect_premium_pattern(data)
     candle, strength = candle_quality(data)
     trap, trap_reason = liquidity_trap_filter(data)
-    accepted, accepted_reason = premium_retest_or_acceptance_filter(data, pattern)
+    accepted, accept_reason = premium_acceptance_filter(data, pattern)
 
     momentum = st["momentum"]
     position = st["position"]
-    rng = st["range"]
-    ltp = data["ltp"]
 
     score = 0
     reasons = [index_bias.get("reason", "")]
 
-    # Pattern + momentum
     if pattern == "PREMIUM_BULLISH_BREAKOUT":
         score += 30
         reasons.append("option premium bullish breakout")
     elif pattern == "PREMIUM_BULLISH_CONTINUATION":
-        score += 24
+        score += 22
         reasons.append("option premium bullish continuation")
-    elif pattern == "PREMIUM_BUYING_PRESSURE":
-        score += 18
-        reasons.append("option premium buying pressure")
+    else:
+        reasons.append("no bullish premium pattern")
 
-    # Candle quality
     if candle == "A_PLUS":
         score += 20
         reasons.append("A+ premium candle")
@@ -403,26 +410,23 @@ def riga_option_buy_logic(
         score += 8
         reasons.append("B grade premium candle")
 
-    # Premium momentum
     if momentum > 0.75:
         score += 20
         reasons.append("strong option premium momentum")
     elif momentum > 0.40:
-        score += 12
-        reasons.append("positive option premium momentum")
+        score += 10
+        reasons.append("moderate option premium momentum")
 
-    # Price position in option premium range.
-    # This is not a day-high/day-low rejection rule. It only rewards premium strength.
     if position > 0.85:
         score += 15
         reasons.append("premium near upper range")
-    elif position > 0.65:
+    elif position > 0.72:
         score += 8
-        reasons.append("premium holding upper half")
+        reasons.append("premium holding upper range")
 
     if accepted:
         score += 10
-        reasons.append(accepted_reason)
+        reasons.append(accept_reason)
 
     if trap:
         score -= 25
@@ -430,48 +434,24 @@ def riga_option_buy_logic(
     else:
         reasons.append(trap_reason)
 
-    trade_bias = "BUY_CE" if option_type == "CE" else "BUY_PE"
-
-    # Structure based premium SL and RR targets
-    # SL below option premium swing/range low with small buffer.
-    buffer_points = max(round(rng * 0.05, 2), 0.05)
-    sl = round(data["low"] - buffer_points, 2)
-
-    if sl >= ltp:
+    levels = make_buy_levels(data)
+    if not levels:
         return {
             "bias": "NO TRADE",
-            "confidence": min(score, 95),
+            "confidence": min(max(score, 0), 95),
             "pattern": pattern,
             "candle": candle,
             "candle_strength": round(strength, 2),
+            "premium_acceptance": accepted,
             "trap_filter": trap_reason,
-            "reason": "Invalid BUY structure: SL is not below entry",
+            "reason": "Invalid BUY option SL/RR structure, " + ", ".join([r for r in reasons if r]),
         }
 
-    risk = round(ltp - sl, 2)
-    t1 = round(ltp + risk * 1.5, 2)
-    t2 = round(ltp + risk * 2.0, 2)
-    t3 = round(ltp + risk * 3.0, 2)
-
-    if t1 <= ltp:
-        return {
-            "bias": "NO TRADE",
-            "confidence": min(score, 95),
-            "reason": "Invalid BUY structure: target is not above entry",
-        }
-
-    if score >= min_confidence:
+    if score >= 70:
+        trade_bias = "BUY_CE" if option_type == "CE" else "BUY_PE"
         return {
             "bias": trade_bias,
-            "entry": round(ltp, 2),
-            "sl": sl,
-            "target": t2,
-            "targets": {
-                "t1": t1,
-                "t2": t2,
-                "t3": t3,
-            },
-            "risk": risk,
+            **levels,
             "confidence": min(score, 95),
             "pattern": pattern,
             "candle": candle,
@@ -483,26 +463,36 @@ def riga_option_buy_logic(
 
     return {
         "bias": "NO TRADE",
-        "confidence": min(score, 95),
+        "confidence": min(max(score, 0), 95),
         "pattern": pattern,
         "candle": candle,
         "candle_strength": round(strength, 2),
         "premium_acceptance": accepted,
         "trap_filter": trap_reason,
-        "reason": "RIGA option buying confirmations below threshold: " + ", ".join([r for r in reasons if r]),
+        "reason": "RIGA option-buy confirmations below 70, " + ", ".join([r for r in reasons if r]),
     }
 
 
-# -----------------------------
-# Option chain
-# -----------------------------
+def round_to_step(price, step):
+    return int(round(price / step) * step)
+
+
+def parse_expiry(expiry):
+    for fmt in ("%d%b%Y", "%d%b%y"):
+        try:
+            return datetime.strptime(str(expiry).upper(), fmt)
+        except Exception:
+            pass
+    return None
+
+
 def get_auto_option_chain(index_name, spot_price, strikes_around=3):
     index_name = index_name.upper()
 
     if index_name not in INDEX_CONFIG:
         raise HTTPException(
             status_code=400,
-            detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX",
+            detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX"
         )
 
     cfg = INDEX_CONFIG[index_name]
@@ -565,49 +555,42 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
     return atm, nearest.strftime("%d%b%Y").upper(), options
 
 
-def enrich_options_with_ltp(client, options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    enriched = []
-
-    for opt in options:
-        data = get_ltp(client, opt)
-        enriched.append({
-            **opt,
-            "premium": data,
-        })
-
-    return enriched
-
-
-def select_best_trade(trades: List[Dict[str, Any]]):
+def select_best_trade(trades):
     if not trades:
         return None
 
-    return sorted(
-        trades,
-        key=lambda x: x["signal"].get("confidence", 0),
-        reverse=True,
-    )[0]
+    # Prefer high confidence, then smaller risk percentage, then closer ATM.
+    def rank(t):
+        sig = t.get("signal", {})
+        data = t.get("data", {})
+        entry = sig.get("entry") or data.get("ltp") or 0
+        risk = sig.get("risk") or 999999
+        risk_pct = (risk / entry) if entry else 999999
+        atm_distance = t.get("atm_distance", 999999)
+        return (
+            sig.get("confidence", 0),
+            -risk_pct,
+            -atm_distance,
+        )
+
+    return sorted(trades, key=rank, reverse=True)[0]
 
 
-# -----------------------------
-# Routes
-# -----------------------------
 @app.get("/")
 def root():
     return {
-        "status": "RIGA v8 OPTION BUYING ONLY LIVE",
-        "allowed_outputs": ["BUY_CE", "BUY_PE", "NO TRADE"],
+        "status": "RIGA v8.1 OPTION BUYING LIVE",
         "features": [
-            "index bullish converts to CE buy scan",
-            "index bearish converts to PE buy scan",
-            "SELL/SHORT/WRITING disabled",
-            "option premium bullish confirmation required",
-            "premium SL below entry",
-            "premium targets above entry",
-            "auto ATM option chain",
-            "option-chain endpoint returns premium LTP/OHLC",
+            "BUY_CE / BUY_PE / NO TRADE only",
+            "index bias to option side mapping",
+            "bullish index scans CE only",
+            "bearish index scans PE only",
+            "premium bullish breakout/continuation",
+            "premium LTP/OHLC in option-chain when include_premium=true",
+            "SL below option premium entry",
+            "targets above option premium entry",
+            "wide SL risk guardrail",
             "liquidity trap filter",
-            "candlestick grading",
             "70 confidence rule",
         ],
     }
@@ -638,7 +621,7 @@ def spot(
 def option_chain(
     index: str = Query("NIFTY"),
     strikes_around: int = Query(3),
-    include_premium: bool = Query(True),
+    include_premium: bool = Query(False),
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
@@ -657,19 +640,27 @@ def option_chain(
     atm, expiry, options = get_auto_option_chain(
         index,
         float(spot_data["ltp"]),
-        strikes_around,
+        strikes_around
     )
 
-    options_out = enrich_options_with_ltp(client, options) if include_premium else options
+    if include_premium:
+        enriched = []
+        for opt in options:
+            premium = get_ltp(client, opt)
+            enriched.append({
+                **opt,
+                "premium": premium,
+            })
+        options = enriched
 
     return {
         "index": index,
         "spot": spot_data,
-        "index_bias": detect_index_bias(spot_data),
+        "index_bias": get_index_bias(spot_data),
         "atm": atm,
         "nearest_expiry": expiry,
-        "options_count": len(options_out),
-        "options": options_out,
+        "options_count": len(options),
+        "options": options,
     }
 
 
@@ -677,7 +668,6 @@ def option_chain(
 def scan_options(
     index: str = Query("NIFTY"),
     strikes_around: int = Query(3),
-    min_confidence: int = Query(70),
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
@@ -693,38 +683,35 @@ def scan_options(
     if not spot_data:
         raise HTTPException(status_code=500, detail="Spot data failed")
 
-    index_bias = detect_index_bias(spot_data)
+    index_bias = get_index_bias(spot_data)
 
     atm, expiry, options = get_auto_option_chain(
         index,
         float(spot_data["ltp"]),
-        strikes_around,
+        strikes_around
     )
+
+    required_side = index_bias.get("option_side")
+    if required_side:
+        options = [o for o in options if o.get("type") == required_side]
+    else:
+        options = []
 
     trades = []
     scanned = 0
 
     for opt in options:
-        # Main conversion:
-        # Bullish index = CE only, Bearish index = PE only.
-        if index_bias.get("option_side") and opt.get("type") != index_bias["option_side"]:
-            continue
-
         data = get_ltp(client, opt)
-        signal = riga_option_buy_logic(
-            data=data,
-            option_type=opt.get("type"),
-            index_bias=index_bias,
-            min_confidence=min_confidence,
-        )
+        signal = riga_option_buy_logic(data, opt.get("type"), index_bias)
         scanned += 1
 
-        if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= min_confidence:
+        if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= 70:
             trade_obj = {
                 "index": index,
                 "option": opt,
                 "data": data,
                 "signal": signal,
+                "atm_distance": abs(opt["strike"] - atm),
             }
             trades.append(trade_obj)
 
@@ -747,7 +734,6 @@ def scan_options(
 @app.get("/scan-all-options")
 def scan_all_options(
     strikes_around: int = Query(2),
-    min_confidence: int = Query(70),
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
@@ -765,38 +751,35 @@ def scan_all_options(
                 output[idx] = {"error": "spot failed"}
                 continue
 
-            index_bias = detect_index_bias(spot_data)
+            index_bias = get_index_bias(spot_data)
 
             atm, expiry, options = get_auto_option_chain(
                 idx,
                 float(spot_data["ltp"]),
-                strikes_around,
+                strikes_around
             )
+
+            required_side = index_bias.get("option_side")
+            if required_side:
+                options = [o for o in options if o.get("type") == required_side]
+            else:
+                options = []
 
             trades = []
             scanned = 0
 
             for opt in options:
-                # Main conversion:
-                # Bullish index = CE only, Bearish index = PE only.
-                if index_bias.get("option_side") and opt.get("type") != index_bias["option_side"]:
-                    continue
-
                 data = get_ltp(client, opt)
-                signal = riga_option_buy_logic(
-                    data=data,
-                    option_type=opt.get("type"),
-                    index_bias=index_bias,
-                    min_confidence=min_confidence,
-                )
+                signal = riga_option_buy_logic(data, opt.get("type"), index_bias)
                 scanned += 1
 
-                if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= min_confidence:
+                if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= 70:
                     trade_obj = {
                         "index": idx,
                         "option": opt,
                         "data": data,
                         "signal": signal,
+                        "atm_distance": abs(opt["strike"] - atm),
                     }
                     trades.append(trade_obj)
                     overall_trades.append(trade_obj)
