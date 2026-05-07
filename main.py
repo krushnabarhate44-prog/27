@@ -56,6 +56,12 @@ DEFAULT_BUFFER_PCT = 0.015  # 1.5% premium buffer below swing low
 MIN_CANDLES = 8
 
 
+
+def now_ist() -> datetime:
+    """Render server may run in UTC; Angel historical API expects IST timestamps."""
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+
 # -----------------------------
 # API Models
 # -----------------------------
@@ -953,7 +959,7 @@ def _fetch_candles(
     Output candle format:
     [time, open, high, low, close, volume]
     """
-    to_dt = datetime.now()
+    to_dt = now_ist()
     from_dt = to_dt - timedelta(minutes=lookback_minutes)
 
     payload = {
@@ -1009,7 +1015,7 @@ def _find_option_candidates(
     cfg = INDEX_CONFIG[index]
     master = _load_scrip_master()
 
-    today = datetime.now().date()
+    today = now_ist().date()
     wanted_strikes = {
         float(atm + offset * cfg["step"])
         for offset in range(-strikes_around, strikes_around + 1)
@@ -1224,7 +1230,7 @@ if FastAPI is not None:
     def health() -> Dict[str, Any]:
         return {
             "status": "ok",
-            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "server_time": now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
             "routes": [
                 "/scan-live/{index}",
                 "/scanOptions",
