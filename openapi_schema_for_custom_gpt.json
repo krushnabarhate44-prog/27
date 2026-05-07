@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "RIGA REAL v5",
-    "version": "5.0.0"
+    "title": "RIGA v9 PRO SNIPER",
+    "version": "9.0.0"
   },
   "servers": [
     {
@@ -13,62 +13,155 @@
     "/health": {
       "get": {
         "operationId": "checkHealth",
-        "summary": "Check health",
+        "summary": "Check backend health",
         "responses": {
-          "200": { "description": "OK" }
+          "200": {
+            "description": "OK"
+          }
         }
       }
     },
-    "/ltp": {
+
+    "/spot": {
       "get": {
-        "operationId": "getLtp",
-        "summary": "Get LTP",
+        "operationId": "getSpotPrice",
+        "summary": "Get spot price",
         "parameters": [
-          { "name": "exchange", "in": "query", "required": true, "schema": { "type": "string" } },
-          { "name": "tradingsymbol", "in": "query", "required": true, "schema": { "type": "string" } },
-          { "name": "symboltoken", "in": "query", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "index",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "LTP response" }
+          "200": {
+            "description": "Spot response"
+          }
         }
       }
     },
-    "/real-riga-signal": {
+
+    "/option-chain": {
       "get": {
-        "operationId": "getRealRigaSignal",
-        "summary": "Get REAL RIGA signal",
+        "operationId": "getOptionChain",
+        "summary": "Get option chain",
         "parameters": [
-          { "name": "exchange", "in": "query", "required": true, "schema": { "type": "string" } },
-          { "name": "tradingsymbol", "in": "query", "required": true, "schema": { "type": "string" } },
-          { "name": "symboltoken", "in": "query", "required": true, "schema": { "type": "string" } }
+          {
+            "name": "index",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+            }
+          },
+          {
+            "name": "strikes_around",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 3
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
         ],
         "responses": {
-          "200": { "description": "REAL RIGA signal" }
+          "200": {
+            "description": "Option chain response"
+          }
         }
       }
     },
-    "/real-riga-scan": {
+
+    "/scan-options": {
       "get": {
-        "operationId": "realRigaScan",
-        "summary": "Scan default watchlist with REAL RIGA",
+        "operationId": "scanOptions",
+        "summary": "Scan one index for sniper trades",
+        "parameters": [
+          {
+            "name": "index",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+            }
+          },
+          {
+            "name": "strikes_around",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 3
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
-          "200": { "description": "REAL RIGA scan result" }
+          "200": {
+            "description": "Scan result"
+          }
+        }
+      }
+    },
+
+    "/scan-all-options": {
+      "get": {
+        "operationId": "scanAllMarkets",
+        "summary": "Scan full market",
+        "parameters": [
+          {
+            "name": "strikes_around",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 3
+            }
+          },
+          {
+            "name": "token",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Full market scan"
+          }
         }
       }
     }
-  },
-  "components": {
-    "schemas": {},
-    "securitySchemes": {
-      "bearerAuth": {
-        "type": "http",
-        "scheme": "bearer"
-      }
-    }
-  },
-  "security": [
-    {
-      "bearerAuth": []
-    }
-  ]
+  }
 }
