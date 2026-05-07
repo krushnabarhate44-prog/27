@@ -1,7 +1,7 @@
 import os
 import requests
-from datetime import datetime
-from typing import Optional
+from datetime import datetime, timedelta
+from typing import Optional, List, Dict, Any
 
 import pyotp
 from dotenv import load_dotenv
@@ -10,7 +10,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA v8 OPTION BUYING SNIPER", version="8.1")
+app = FastAPI(title="RIGA v9 PRO SNIPER", version="9.0")
 
 ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
 ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
@@ -54,36 +54,28 @@ INDEX_CONFIG = {
 def check_token(authorization: Optional[str], token: Optional[str]):
     if not RIGA_ACTION_TOKEN:
         return
-
     if authorization == f"Bearer {RIGA_ACTION_TOKEN}":
         return
-
     if token == RIGA_ACTION_TOKEN:
         return
-
     raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 def get_client():
     global client_obj
-
     if client_obj:
         return client_obj
 
+    if not all([ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PASSWORD, ANGEL_TOTP_SECRET]):
+        raise HTTPException(status_code=500, detail="Missing Angel credentials in .env")
+
     client = SmartConnect(api_key=ANGEL_API_KEY)
+    totp = pyotp.TOTP(ANGEL_TOTP_SECRET.strip().replace(" ", "").upper()).now()
 
-    totp = pyotp.TOTP(
-        ANGEL_TOTP_SECRET.strip().replace(" ", "").upper()
-    ).now()
-
-    session = client.generateSession(
-        ANGEL_CLIENT_CODE,
-        ANGEL_PASSWORD,
-        totp
-    )
+    session = client.generateSession(ANGEL_CLIENT_CODE, ANGEL_PASSWORD, totp)
 
     if not session or not session.get("status"):
-        raise HTTPException(status_code=500, detail="Angel login failed")
+        raise HTTPException(status_code=500, detail=f"Angel login failed: {session}")
 
     client_obj = client
     return client
@@ -91,36 +83,29 @@ def get_client():
 
 def load_scrip_master():
     global scrip_master_cache
-
     if scrip_master_cache:
         return scrip_master_cache
 
     res = requests.get(SCRIP_MASTER_URL, timeout=25)
     res.raise_for_status()
-
     scrip_master_cache = res.json()
     return scrip_master_cache
 
 
-def get_ltp(client, item):
+def get_ltp(client, item: Dict[str, Any]):
     try:
-        res = client.ltpData(
-            item["exchange"],
-            item["tradingsymbol"],
-            str(item["symboltoken"])
-        )
+        res = client.ltpData(item["exchange"], item["tradingsymbol"], str(item["symboltoken"]))
     except Exception:
         return None
 
     if not res or not res.get("status"):
         return None
 
-    d = res.get("data", {})
-
+    d = res.get("data", {}) or {}
     return {
         "symbol": item["tradingsymbol"],
         "exchange": item["exchange"],
-        "token": item["symboltoken"],
+        "token": str(item["symboltoken"]),
         "ltp": d.get("ltp"),
         "open": d.get("open"),
         "high": d.get("high"),
@@ -129,348 +114,44 @@ def get_ltp(client, item):
     }
 
 
+def get_candles(client, exchange: str, symboltoken: str, interval: str = "FIVE_MINUTE", lookback_minutes: int = 390):
+    now = datetime.now()
+    start = now - timedelta(minutes=lookback_minutes)
+
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(symboltoken),
+        "interval": interval,
+        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+        "todate": now.strftime("%Y-%m-%d %H:%M"),
+    }
+
+    try:
+        res = client.getCandleData(params)
+    except Exception:
+        return []
+
+    if not res or not res.get("status"):
+        return []
+
+    candles = []
+    for row in res.get("data", []) or []:
+        try:
+            candles.append({
+                "time": row[0],
+                "open": float(row[1]),
+                "high": float(row[2]),
+                "low": float(row[3]),
+                "close": float(row[4]),
+                "volume": float(row[5]) if len(row) > 5 and row[5] is not None else 0.0,
+            })
+        except Exception:
+            continue
+    return candles
+
+
 def safe_num(value):
     return isinstance(value, (int, float)) and value is not None
-
-
-def candle_stats(data):
-    if not data:
-        return None
-
-    high = data.get("high")
-    low = data.get("low")
-    ltp = data.get("ltp")
-    open_p = data.get("open")
-
-    if not all(safe_num(x) for x in [high, low, ltp, open_p]):
-        return None
-
-    rng = high - low
-    if rng <= 0:
-        return None
-
-    body = abs(ltp - open_p)
-    upper_wick = high - max(open_p, ltp)
-    lower_wick = min(open_p, ltp) - low
-    position = (ltp - low) / rng
-    momentum = ((ltp - open_p) / open_p) * 100 if open_p else 0
-    strength = body / rng
-
-    return {
-        "range": rng,
-        "body": body,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
-        "position": position,
-        "momentum": momentum,
-        "strength": strength,
-    }
-
-
-def candle_quality(data):
-    st = candle_stats(data)
-    if not st:
-        return "BAD", 0
-
-    strength = st["strength"]
-
-    if strength >= 0.70:
-        return "A_PLUS", strength
-    if strength >= 0.60:
-        return "A_GRADE", strength
-    if strength >= 0.45:
-        return "B_GRADE", strength
-
-    return "LOW_QUALITY", strength
-
-
-def detect_premium_pattern(data):
-    st = candle_stats(data)
-    if not st:
-        return "NO_PATTERN"
-
-    pos = st["position"]
-    mom = st["momentum"]
-    strength = st["strength"]
-
-    if pos > 0.88 and mom > 0.75 and strength >= 0.60:
-        return "PREMIUM_BULLISH_BREAKOUT"
-
-    if pos > 0.72 and mom > 0.40 and strength >= 0.45:
-        return "PREMIUM_BULLISH_CONTINUATION"
-
-    return "NO_PATTERN"
-
-
-def liquidity_trap_filter(data):
-    st = candle_stats(data)
-    if not st:
-        return True, "bad candle data"
-
-    body = st["body"]
-    upper_wick = st["upper_wick"]
-    lower_wick = st["lower_wick"]
-    pos = st["position"]
-
-    if body <= 0:
-        return True, "doji/no body trap"
-
-    if upper_wick > body * 1.7 and pos < 0.75:
-        return True, "upper wick rejection trap"
-
-    if lower_wick > body * 1.7 and pos > 0.25:
-        return True, "lower wick rejection trap"
-
-    return False, "no liquidity trap"
-
-
-def premium_acceptance_filter(data, pattern):
-    st = candle_stats(data)
-    if not st:
-        return False, "no premium acceptance data"
-
-    # Option buying only: CE/PE premium must close/ltp in upper range.
-    if pattern in ["PREMIUM_BULLISH_BREAKOUT", "PREMIUM_BULLISH_CONTINUATION"]:
-        if st["position"] >= 0.72:
-            return True, "premium bullish acceptance"
-
-    return False, "premium acceptance not confirmed"
-
-
-def get_index_bias(spot_data, min_change_pct=0.10):
-    if not spot_data:
-        return {
-            "bias": "NEUTRAL",
-            "option_side": None,
-            "reason": "spot data missing",
-            "change_pct": 0,
-        }
-
-    ltp = spot_data.get("ltp")
-    close = spot_data.get("close")
-
-    if not safe_num(ltp) or not safe_num(close) or close == 0:
-        return {
-            "bias": "NEUTRAL",
-            "option_side": None,
-            "reason": "invalid spot close/ltp",
-            "change_pct": 0,
-        }
-
-    change_pct = round(((ltp - close) / close) * 100, 2)
-
-    if change_pct >= min_change_pct:
-        return {
-            "bias": "BULLISH",
-            "option_side": "CE",
-            "reason": f"index bullish vs previous close ({change_pct}%)",
-            "change_pct": change_pct,
-        }
-
-    if change_pct <= -min_change_pct:
-        return {
-            "bias": "BEARISH",
-            "option_side": "PE",
-            "reason": f"index bearish vs previous close ({change_pct}%)",
-            "change_pct": change_pct,
-        }
-
-    return {
-        "bias": "NEUTRAL",
-        "option_side": None,
-        "reason": f"index neutral vs previous close ({change_pct}%)",
-        "change_pct": change_pct,
-    }
-
-
-def make_buy_levels(data):
-    """
-    Option buying levels.
-    SL is below option premium recent low with buffer.
-    Buffer is dynamic but capped so SL does not become unnecessarily wide.
-    """
-    st = candle_stats(data)
-    if not st:
-        return None
-
-    ltp = data.get("ltp")
-    low = data.get("low")
-    rng = st["range"]
-
-    if not safe_num(ltp) or not safe_num(low):
-        return None
-
-    # Structure-based approximation with only OHLC:
-    # SL below day's/recent option low + small buffer.
-    buffer = max(round(ltp * 0.01, 2), round(rng * 0.03, 2), 1.0)
-    sl = round(low - buffer, 2)
-
-    risk = round(ltp - sl, 2)
-
-    # Risk guardrails: reject very tight or very wide SL.
-    min_risk = max(round(ltp * 0.01, 2), 1.0)
-    max_risk = round(ltp * 0.35, 2)
-
-    if risk <= min_risk:
-        return None
-
-    if risk > max_risk:
-        # Fallback to tighter structural SL around lower wick/open zone.
-        alt_sl = round(ltp - max_risk, 2)
-        if alt_sl < ltp:
-            sl = alt_sl
-            risk = round(ltp - sl, 2)
-        else:
-            return None
-
-    t1 = round(ltp + risk * 1.5, 2)
-    t2 = round(ltp + risk * 2.0, 2)
-    t3 = round(ltp + risk * 3.0, 2)
-
-    if not (sl < ltp < t1 < t2 < t3):
-        return None
-
-    return {
-        "entry": round(ltp, 2),
-        "sl": sl,
-        "target": t2,
-        "targets": {
-            "t1": t1,
-            "t2": t2,
-            "t3": t3,
-        },
-        "risk": risk,
-    }
-
-
-def riga_option_buy_logic(data, option_type, index_bias):
-    """
-    Final RIGA execution rule:
-    - Bullish index -> BUY CE only
-    - Bearish index -> BUY PE only
-    - No SELL/SHORT/WRITING output
-    """
-    if not data:
-        return {
-            "bias": "NO TRADE",
-            "confidence": 0,
-            "reason": "No option premium data",
-        }
-
-    if not index_bias or index_bias.get("option_side") not in ["CE", "PE"]:
-        return {
-            "bias": "NO TRADE",
-            "confidence": 0,
-            "reason": "Index bias neutral/invalid",
-        }
-
-    required_side = index_bias["option_side"]
-    if option_type != required_side:
-        return {
-            "bias": "NO TRADE",
-            "confidence": 0,
-            "reason": f"Option side skipped; index requires {required_side}",
-        }
-
-    st = candle_stats(data)
-    if not st:
-        return {
-            "bias": "NO TRADE",
-            "confidence": 0,
-            "reason": "Invalid option OHLC data",
-        }
-
-    pattern = detect_premium_pattern(data)
-    candle, strength = candle_quality(data)
-    trap, trap_reason = liquidity_trap_filter(data)
-    accepted, accept_reason = premium_acceptance_filter(data, pattern)
-
-    momentum = st["momentum"]
-    position = st["position"]
-
-    score = 0
-    reasons = [index_bias.get("reason", "")]
-
-    if pattern == "PREMIUM_BULLISH_BREAKOUT":
-        score += 30
-        reasons.append("option premium bullish breakout")
-    elif pattern == "PREMIUM_BULLISH_CONTINUATION":
-        score += 22
-        reasons.append("option premium bullish continuation")
-    else:
-        reasons.append("no bullish premium pattern")
-
-    if candle == "A_PLUS":
-        score += 20
-        reasons.append("A+ premium candle")
-    elif candle == "A_GRADE":
-        score += 15
-        reasons.append("A grade premium candle")
-    elif candle == "B_GRADE":
-        score += 8
-        reasons.append("B grade premium candle")
-
-    if momentum > 0.75:
-        score += 20
-        reasons.append("strong option premium momentum")
-    elif momentum > 0.40:
-        score += 10
-        reasons.append("moderate option premium momentum")
-
-    if position > 0.85:
-        score += 15
-        reasons.append("premium near upper range")
-    elif position > 0.72:
-        score += 8
-        reasons.append("premium holding upper range")
-
-    if accepted:
-        score += 10
-        reasons.append(accept_reason)
-
-    if trap:
-        score -= 25
-        reasons.append(trap_reason)
-    else:
-        reasons.append(trap_reason)
-
-    levels = make_buy_levels(data)
-    if not levels:
-        return {
-            "bias": "NO TRADE",
-            "confidence": min(max(score, 0), 95),
-            "pattern": pattern,
-            "candle": candle,
-            "candle_strength": round(strength, 2),
-            "premium_acceptance": accepted,
-            "trap_filter": trap_reason,
-            "reason": "Invalid BUY option SL/RR structure, " + ", ".join([r for r in reasons if r]),
-        }
-
-    if score >= 70:
-        trade_bias = "BUY_CE" if option_type == "CE" else "BUY_PE"
-        return {
-            "bias": trade_bias,
-            **levels,
-            "confidence": min(score, 95),
-            "pattern": pattern,
-            "candle": candle,
-            "candle_strength": round(strength, 2),
-            "premium_acceptance": accepted,
-            "trap_filter": trap_reason,
-            "reason": ", ".join([r for r in reasons if r]),
-        }
-
-    return {
-        "bias": "NO TRADE",
-        "confidence": min(max(score, 0), 95),
-        "pattern": pattern,
-        "candle": candle,
-        "candle_strength": round(strength, 2),
-        "premium_acceptance": accepted,
-        "trap_filter": trap_reason,
-        "reason": "RIGA option-buy confirmations below 70, " + ", ".join([r for r in reasons if r]),
-    }
 
 
 def round_to_step(price, step):
@@ -486,23 +167,136 @@ def parse_expiry(expiry):
     return None
 
 
+def avg(values: List[float]) -> float:
+    vals = [v for v in values if safe_num(v)]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def pct_change(a: float, b: float) -> float:
+    if not b:
+        return 0.0
+    return ((a - b) / b) * 100
+
+
+def candle_body(c):
+    return abs(c["close"] - c["open"])
+
+
+def candle_range(c):
+    return max(c["high"] - c["low"], 0.01)
+
+
+def candle_strength(c):
+    return candle_body(c) / candle_range(c)
+
+
+def candle_position(c):
+    return (c["close"] - c["low"]) / candle_range(c)
+
+
+def upper_wick(c):
+    return c["high"] - max(c["open"], c["close"])
+
+
+def lower_wick(c):
+    return min(c["open"], c["close"]) - c["low"]
+
+
+def is_bull_candle(c):
+    return c["close"] > c["open"]
+
+
+def is_bear_candle(c):
+    return c["close"] < c["open"]
+
+
+def calc_vwap(candles: List[Dict[str, Any]]):
+    total_pv = 0.0
+    total_v = 0.0
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3
+        v = c.get("volume", 0) or 0
+        total_pv += tp * v
+        total_v += v
+    if total_v <= 0:
+        return None
+    return total_pv / total_v
+
+
+def find_swing_levels(candles: List[Dict[str, Any]], lookback: int = 20):
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+    if not recent:
+        return None
+    prev = recent[:-1] if len(recent) > 1 else recent
+    return {
+        "swing_high": max(c["high"] for c in recent),
+        "swing_low": min(c["low"] for c in recent),
+        "prev_high": max(c["high"] for c in prev),
+        "prev_low": min(c["low"] for c in prev),
+    }
+
+
+def volume_spike(candles: List[Dict[str, Any]], lookback: int = 20):
+    if len(candles) < 5:
+        return False, 0.0
+    last_v = candles[-1].get("volume", 0) or 0
+    prev_vols = [c.get("volume", 0) or 0 for c in candles[-lookback-1:-1]]
+    base = avg(prev_vols)
+    if base <= 0:
+        return False, 0.0
+    ratio = last_v / base
+    return ratio >= 1.25, round(ratio, 2)
+
+
+def classify_candle(c):
+    strength = candle_strength(c)
+    pos = candle_position(c)
+
+    if strength >= 0.70 and pos >= 0.75 and is_bull_candle(c):
+        return "A_PLUS_BULL"
+    if strength >= 0.60 and pos >= 0.65 and is_bull_candle(c):
+        return "A_BULL"
+    if strength >= 0.45 and pos >= 0.60 and is_bull_candle(c):
+        return "B_BULL"
+
+    if strength >= 0.70 and pos <= 0.25 and is_bear_candle(c):
+        return "A_PLUS_BEAR"
+    if strength >= 0.60 and pos <= 0.35 and is_bear_candle(c):
+        return "A_BEAR"
+    if strength >= 0.45 and pos <= 0.40 and is_bear_candle(c):
+        return "B_BEAR"
+
+    return "LOW_QUALITY"
+
+
+def trap_filter(c):
+    body = max(candle_body(c), 0.01)
+    uw = upper_wick(c)
+    lw = lower_wick(c)
+    pos = candle_position(c)
+
+    if candle_strength(c) < 0.35:
+        return True, "weak body / indecision"
+
+    if uw > body * 1.8 and pos < 0.75:
+        return True, "upper wick rejection / fake breakout risk"
+
+    if lw > body * 1.8 and pos > 0.25:
+        return True, "lower wick rejection / fake breakdown risk"
+
+    return False, "no liquidity trap"
+
+
 def get_auto_option_chain(index_name, spot_price, strikes_around=3):
     index_name = index_name.upper()
-
     if index_name not in INDEX_CONFIG:
-        raise HTTPException(
-            status_code=400,
-            detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX"
-        )
+        raise HTTPException(status_code=400, detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX")
 
     cfg = INDEX_CONFIG[index_name]
     master = load_scrip_master()
 
     atm = round_to_step(spot_price, cfg["step"])
-    allowed = {
-        atm + i * cfg["step"]
-        for i in range(-strikes_around, strikes_around + 1)
-    }
+    allowed = {atm + i * cfg["step"] for i in range(-strikes_around, strikes_around + 1)}
 
     today = datetime.now()
     found = []
@@ -537,7 +331,6 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
                 "expiry": s.get("expiry"),
                 "expiry_dt": expiry_dt,
             })
-
         except Exception:
             continue
 
@@ -551,48 +344,264 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
         x.pop("expiry_dt", None)
 
     options.sort(key=lambda x: (abs(x["strike"] - atm), x["strike"], x["type"]))
-
     return atm, nearest.strftime("%d%b%Y").upper(), options
+
+
+def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles: List[Dict[str, Any]]):
+    if not candles or len(candles) < 10:
+        ltp = spot_data.get("ltp")
+        close = spot_data.get("close")
+        if safe_num(ltp) and safe_num(close):
+            chg = pct_change(ltp, close)
+            if chg >= 0.12:
+                return {"bias": "BULLISH", "option_side": "CE", "score": 55, "reason": f"fallback bullish vs close {round(chg,2)}%"}
+            if chg <= -0.12:
+                return {"bias": "BEARISH", "option_side": "PE", "score": 55, "reason": f"fallback bearish vs close {round(chg,2)}%"}
+        return {"bias": "NEUTRAL", "option_side": None, "score": 0, "reason": "not enough index candle data"}
+
+    last = candles[-1]
+    levels = find_swing_levels(candles, 20)
+    vwap = calc_vwap(candles)
+    vol_ok, vol_ratio = volume_spike(candles)
+
+    last_close = last["close"]
+    prev_close = candles[-2]["close"]
+    first_open = candles[0]["open"]
+
+    score_bull = 0
+    score_bear = 0
+    bull = []
+    bear = []
+
+    intraday_change = pct_change(last_close, first_open)
+    last_momentum = pct_change(last_close, prev_close)
+
+    if intraday_change > 0.12:
+        score_bull += 20
+        bull.append(f"index intraday bullish {round(intraday_change,2)}%")
+    if intraday_change < -0.12:
+        score_bear += 20
+        bear.append(f"index intraday bearish {round(intraday_change,2)}%")
+
+    if vwap:
+        if last_close > vwap:
+            score_bull += 15
+            bull.append("index above VWAP")
+        elif last_close < vwap:
+            score_bear += 15
+            bear.append("index below VWAP")
+
+    if levels and last_close > levels["prev_high"]:
+        score_bull += 25
+        bull.append("index breakout above swing high")
+    if levels and last_close < levels["prev_low"]:
+        score_bear += 25
+        bear.append("index breakdown below swing low")
+
+    cq = classify_candle(last)
+    if cq in ["A_PLUS_BULL", "A_BULL"]:
+        score_bull += 15
+        bull.append(f"index {cq}")
+    if cq in ["A_PLUS_BEAR", "A_BEAR"]:
+        score_bear += 15
+        bear.append(f"index {cq}")
+
+    if last_momentum > 0.03:
+        score_bull += 10
+        bull.append("last candle bullish momentum")
+    if last_momentum < -0.03:
+        score_bear += 10
+        bear.append("last candle bearish momentum")
+
+    if vol_ok:
+        score_bull += 5
+        score_bear += 5
+        bull.append(f"volume spike {vol_ratio}x")
+        bear.append(f"volume spike {vol_ratio}x")
+
+    trap, _ = trap_filter(last)
+    if trap:
+        score_bull -= 20
+        score_bear -= 20
+
+    if score_bull >= 55 and score_bull > score_bear:
+        return {"bias": "BULLISH", "option_side": "CE", "score": min(score_bull, 95), "vwap": round(vwap, 2) if vwap else None, "reason": ", ".join(bull)}
+
+    if score_bear >= 55 and score_bear > score_bull:
+        return {"bias": "BEARISH", "option_side": "PE", "score": min(score_bear, 95), "vwap": round(vwap, 2) if vwap else None, "reason": ", ".join(bear)}
+
+    return {"bias": "NEUTRAL", "option_side": None, "score": max(score_bull, score_bear), "vwap": round(vwap, 2) if vwap else None, "reason": "index structure not clean enough"}
+
+
+def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name):
+    side = index_bias.get("option_side")
+    if side not in ["CE", "PE"]:
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "index neutral"}
+
+    if opt.get("type") != side:
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "option side not aligned"}
+
+    if not ltp_data or not safe_num(ltp_data.get("ltp")):
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "no option LTP"}
+
+    if not candles or len(candles) < 10:
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "not enough option candle data"}
+
+    last = candles[-1]
+    levels = find_swing_levels(candles, 20)
+    vwap = calc_vwap(candles)
+    vol_ok, vol_ratio = volume_spike(candles)
+
+    entry = float(ltp_data["ltp"])
+    score = 0
+    reasons = []
+
+    idx_score = index_bias.get("score", 0)
+    if idx_score >= 70:
+        score += 20
+    elif idx_score >= 55:
+        score += 12
+    reasons.append(index_bias.get("reason", ""))
+
+    if not levels:
+        return {"bias": "NO TRADE", "confidence": score, "reason": "no swing levels"}
+
+    if last["close"] > levels["prev_high"]:
+        score += 25
+        reasons.append("premium breakout above swing high")
+        pattern = "PREMIUM_BREAKOUT"
+    elif vwap and last["close"] > vwap and last["close"] > candles[-2]["close"]:
+        score += 10
+        reasons.append("premium continuation above VWAP")
+        pattern = "PREMIUM_CONTINUATION"
+    else:
+        return {"bias": "NO TRADE", "confidence": score, "reason": "premium breakout not activated"}
+
+    cq = classify_candle(last)
+    strength = candle_strength(last)
+    if cq == "A_PLUS_BULL":
+        score += 20
+        reasons.append("A+ bullish premium candle")
+    elif cq == "A_BULL":
+        score += 15
+        reasons.append("A grade bullish premium candle")
+    else:
+        return {"bias": "NO TRADE", "confidence": score, "pattern": pattern, "candle": cq, "reason": "premium candle quality not strong"}
+
+    mom = pct_change(last["close"], candles[-2]["close"])
+    if mom > 0.25:
+        score += 15
+        reasons.append(f"strong premium momentum {round(mom,2)}%")
+    elif mom > 0.08:
+        score += 8
+        reasons.append(f"premium momentum {round(mom,2)}%")
+
+    if vwap and last["close"] > vwap:
+        score += 10
+        reasons.append("premium above VWAP")
+
+    if vol_ok:
+        score += 10
+        reasons.append(f"volume expansion {vol_ratio}x")
+
+    trap, trap_reason = trap_filter(last)
+    if trap:
+        return {"bias": "NO TRADE", "confidence": max(score - 25, 0), "pattern": pattern, "candle": cq, "trap_filter": trap_reason, "reason": f"trap rejected: {trap_reason}"}
+
+    step = INDEX_CONFIG[index_name]["step"]
+    atm_distance = abs(opt["strike"] - atm)
+
+    if atm_distance == 0:
+        score += 10
+        reasons.append("ATM strike")
+    elif atm_distance <= step:
+        score += 7
+        reasons.append("near ATM strike")
+    elif atm_distance <= step * 2:
+        score += 2
+        reasons.append("acceptable strike distance")
+    else:
+        score -= 15
+        reasons.append("far from ATM penalty")
+
+    buffer = max(entry * 0.015, 2.0)
+    structure_sl = min(levels["swing_low"], levels["prev_low"]) - buffer
+    risk = round(entry - structure_sl, 2)
+    risk_pct = (risk / entry) * 100 if entry else 999
+
+    if structure_sl <= 0 or structure_sl >= entry:
+        return {"bias": "NO TRADE", "confidence": score, "reason": "invalid structure SL"}
+
+    if risk_pct > 22:
+        return {"bias": "NO TRADE", "confidence": score, "entry": round(entry, 2), "sl": round(structure_sl, 2), "risk_pct": round(risk_pct, 2), "reason": "risk too wide >22%"}
+
+    if risk_pct < 2:
+        return {"bias": "NO TRADE", "confidence": score, "entry": round(entry, 2), "sl": round(structure_sl, 2), "risk_pct": round(risk_pct, 2), "reason": "risk too tight / noise SL"}
+
+    t1 = round(entry + risk * 1.5, 2)
+    t2 = round(entry + risk * 2.0, 2)
+    t3 = round(entry + risk * 3.0, 2)
+
+    if not (structure_sl < entry < t1 < t2 < t3):
+        return {"bias": "NO TRADE", "confidence": score, "reason": "RR structure invalid"}
+
+    confidence = min(score, 95)
+    if confidence < 85:
+        return {"bias": "NO TRADE", "confidence": confidence, "pattern": pattern, "candle": cq, "reason": "RIGA v9 sniper score below 85"}
+
+    return {
+        "bias": "BUY_CE" if side == "CE" else "BUY_PE",
+        "entry": round(entry, 2),
+        "sl": round(structure_sl, 2),
+        "target": t2,
+        "targets": {"t1": t1, "t2": t2, "t3": t3},
+        "risk": risk,
+        "risk_pct": round(risk_pct, 2),
+        "confidence": confidence,
+        "pattern": pattern,
+        "candle": cq,
+        "candle_strength": round(strength, 2),
+        "premium_vwap": round(vwap, 2) if vwap else None,
+        "volume_spike": vol_ratio if vol_ok else None,
+        "atm_distance": atm_distance,
+        "trap_filter": trap_reason,
+        "reason": ", ".join([r for r in reasons if r]),
+    }
 
 
 def select_best_trade(trades):
     if not trades:
         return None
 
-    # Prefer high confidence, then smaller risk percentage, then closer ATM.
-    def rank(t):
-        sig = t.get("signal", {})
-        data = t.get("data", {})
-        entry = sig.get("entry") or data.get("ltp") or 0
-        risk = sig.get("risk") or 999999
-        risk_pct = (risk / entry) if entry else 999999
-        atm_distance = t.get("atm_distance", 999999)
+    def score_key(t):
+        sig = t["signal"]
         return (
             sig.get("confidence", 0),
-            -risk_pct,
-            -atm_distance,
+            -sig.get("atm_distance", 9999),
+            -sig.get("risk_pct", 99),
         )
 
-    return sorted(trades, key=rank, reverse=True)[0]
+    return sorted(trades, key=score_key, reverse=True)[0]
 
 
 @app.get("/")
 def root():
     return {
-        "status": "RIGA v8.1 OPTION BUYING LIVE",
+        "status": "RIGA v9 PRO SNIPER LIVE",
         "features": [
             "BUY_CE / BUY_PE / NO TRADE only",
-            "index bias to option side mapping",
-            "bullish index scans CE only",
-            "bearish index scans PE only",
-            "premium bullish breakout/continuation",
-            "premium LTP/OHLC in option-chain when include_premium=true",
-            "SL below option premium entry",
-            "targets above option premium entry",
-            "wide SL risk guardrail",
-            "liquidity trap filter",
-            "70 confidence rule",
-        ],
+            "index candle structure engine",
+            "option premium candle engine",
+            "VWAP acceptance",
+            "swing high / swing low breakout",
+            "volume spike filter",
+            "trap / wick rejection filter",
+            "structure-based SL",
+            "risk cap <= 22%",
+            "score >= 85 only",
+            "ATM priority",
+            "one best sniper trade"
+        ]
     }
 
 
@@ -602,208 +611,103 @@ def health():
 
 
 @app.get("/spot")
-def spot(
-    index: str = Query("NIFTY"),
-    authorization: Optional[str] = Header(None),
-    token: Optional[str] = Query(None),
-):
+def spot(index: str = Query("NIFTY"), authorization: Optional[str] = Header(None), token: Optional[str] = Query(None)):
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
-
     client = get_client()
     return get_ltp(client, INDEX_CONFIG[index]["spot"])
 
 
 @app.get("/option-chain")
-def option_chain(
-    index: str = Query("NIFTY"),
-    strikes_around: int = Query(3),
-    include_premium: bool = Query(False),
-    authorization: Optional[str] = Header(None),
-    token: Optional[str] = Query(None),
-):
+def option_chain(index: str = Query("NIFTY"), strikes_around: int = Query(3), include_premium: bool = Query(False), authorization: Optional[str] = Header(None), token: Optional[str] = Query(None)):
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
 
     client = get_client()
     spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
-
     if not spot_data:
         raise HTTPException(status_code=500, detail="Spot data failed")
 
-    atm, expiry, options = get_auto_option_chain(
-        index,
-        float(spot_data["ltp"]),
-        strikes_around
-    )
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
 
     if include_premium:
-        enriched = []
         for opt in options:
-            premium = get_ltp(client, opt)
-            enriched.append({
-                **opt,
-                "premium": premium,
-            })
-        options = enriched
+            opt["premium"] = get_ltp(client, opt)
 
-    return {
-        "index": index,
-        "spot": spot_data,
-        "index_bias": get_index_bias(spot_data),
-        "atm": atm,
-        "nearest_expiry": expiry,
-        "options_count": len(options),
-        "options": options,
-    }
+    return {"index": index, "spot": spot_data, "atm": atm, "nearest_expiry": expiry, "options_count": len(options), "options": options}
 
 
 @app.get("/scan-options")
-def scan_options(
-    index: str = Query("NIFTY"),
-    strikes_around: int = Query(3),
-    authorization: Optional[str] = Header(None),
-    token: Optional[str] = Query(None),
-):
+def scan_options(index: str = Query("NIFTY"), strikes_around: int = Query(3), interval: str = Query("FIVE_MINUTE"), authorization: Optional[str] = Header(None), token: Optional[str] = Query(None)):
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
 
     client = get_client()
-    spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
-
+    spot_item = INDEX_CONFIG[index]["spot"]
+    spot_data = get_ltp(client, spot_item)
     if not spot_data:
         raise HTTPException(status_code=500, detail="Spot data failed")
 
-    index_bias = get_index_bias(spot_data)
+    index_candles = get_candles(client, spot_item["exchange"], spot_item["symboltoken"], interval=interval)
+    index_bias = analyze_index_structure(index, spot_data, index_candles)
+    index_bias["index"] = index
 
-    atm, expiry, options = get_auto_option_chain(
-        index,
-        float(spot_data["ltp"]),
-        strikes_around
-    )
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
+    side = index_bias.get("option_side")
 
-    required_side = index_bias.get("option_side")
-    if required_side:
-        options = [o for o in options if o.get("type") == required_side]
-    else:
-        options = []
+    if side not in ["CE", "PE"]:
+        return {"index": index, "spot_ltp": spot_data["ltp"], "spot_close": spot_data.get("close"), "index_bias": index_bias, "atm": atm, "nearest_expiry": expiry, "total_options_scanned": 0, "trade_count": 0, "best_trade": "NO TRADE", "trades": []}
+
+    options = [opt for opt in options if opt["type"] == side]
 
     trades = []
     scanned = 0
 
     for opt in options:
-        data = get_ltp(client, opt)
-        signal = riga_option_buy_logic(data, opt.get("type"), index_bias)
+        ltp_data = get_ltp(client, opt)
+        opt_candles = get_candles(client, opt["exchange"], opt["symboltoken"], interval=interval)
+        signal = analyze_option_buy_setup(index_bias, opt, ltp_data, opt_candles, atm, index)
         scanned += 1
 
-        if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= 70:
-            trade_obj = {
-                "index": index,
-                "option": opt,
-                "data": data,
-                "signal": signal,
-                "atm_distance": abs(opt["strike"] - atm),
-            }
-            trades.append(trade_obj)
+        if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= 85:
+            trades.append({"index": index, "option": opt, "data": ltp_data, "signal": signal, "atm_distance": signal.get("atm_distance", abs(opt["strike"] - atm))})
 
     best_trade = select_best_trade(trades)
 
-    return {
-        "index": index,
-        "spot_ltp": spot_data["ltp"],
-        "spot_close": spot_data.get("close"),
-        "index_bias": index_bias,
-        "atm": atm,
-        "nearest_expiry": expiry,
-        "total_options_scanned": scanned,
-        "trade_count": len(trades),
-        "best_trade": best_trade if best_trade else "NO TRADE",
-        "trades": trades[:5],
-    }
+    return {"index": index, "spot_ltp": spot_data["ltp"], "spot_close": spot_data.get("close"), "index_bias": index_bias, "atm": atm, "nearest_expiry": expiry, "total_options_scanned": scanned, "trade_count": len(trades), "best_trade": best_trade if best_trade else "NO TRADE", "trades": trades[:5]}
 
 
 @app.get("/scan-all-options")
-def scan_all_options(
-    strikes_around: int = Query(2),
-    authorization: Optional[str] = Header(None),
-    token: Optional[str] = Query(None),
-):
+def scan_all_options(strikes_around: int = Query(3), interval: str = Query("FIVE_MINUTE"), authorization: Optional[str] = Header(None), token: Optional[str] = Query(None)):
     check_token(authorization, token)
 
     output = {}
     overall_trades = []
-    client = get_client()
 
     for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
         try:
-            spot_data = get_ltp(client, INDEX_CONFIG[idx]["spot"])
-
-            if not spot_data:
-                output[idx] = {"error": "spot failed"}
-                continue
-
-            index_bias = get_index_bias(spot_data)
-
-            atm, expiry, options = get_auto_option_chain(
-                idx,
-                float(spot_data["ltp"]),
-                strikes_around
-            )
-
-            required_side = index_bias.get("option_side")
-            if required_side:
-                options = [o for o in options if o.get("type") == required_side]
-            else:
-                options = []
-
-            trades = []
-            scanned = 0
-
-            for opt in options:
-                data = get_ltp(client, opt)
-                signal = riga_option_buy_logic(data, opt.get("type"), index_bias)
-                scanned += 1
-
-                if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= 70:
-                    trade_obj = {
-                        "index": idx,
-                        "option": opt,
-                        "data": data,
-                        "signal": signal,
-                        "atm_distance": abs(opt["strike"] - atm),
-                    }
-                    trades.append(trade_obj)
-                    overall_trades.append(trade_obj)
-
-            best_trade = select_best_trade(trades)
-
+            result = scan_options(index=idx, strikes_around=strikes_around, interval=interval, authorization=authorization, token=token)
             output[idx] = {
-                "spot_ltp": spot_data["ltp"],
-                "spot_close": spot_data.get("close"),
-                "index_bias": index_bias,
-                "atm": atm,
-                "expiry": expiry,
-                "total_options_scanned": scanned,
-                "trade_count": len(trades),
-                "best_trade": best_trade if best_trade else "NO TRADE",
-                "trades": trades[:3],
+                "spot_ltp": result.get("spot_ltp"),
+                "spot_close": result.get("spot_close"),
+                "index_bias": result.get("index_bias"),
+                "atm": result.get("atm"),
+                "expiry": result.get("nearest_expiry"),
+                "total_options_scanned": result.get("total_options_scanned"),
+                "trade_count": result.get("trade_count"),
+                "best_trade": result.get("best_trade"),
+                "trades": result.get("trades", [])[:3],
             }
-
+            for t in result.get("trades", []):
+                overall_trades.append(t)
         except Exception as e:
             output[idx] = {"error": str(e)}
 
     overall_best = select_best_trade(overall_trades)
-
-    return {
-        "overall_best_trade": overall_best if overall_best else "NO TRADE",
-        "markets": output,
-    }
+    return {"overall_best_trade": overall_best if overall_best else "NO TRADE", "markets": output}
