@@ -1,35 +1,50 @@
-# RIGA REAL AI Backend v5 🚀
+# RIGA v9 PRO SNIPER 🚀
 
-Advanced pattern-based trading system built by Krushna.
+Advanced high probability option buying system.
 
 -------------------------------------
 
 ## 🔥 FEATURES
 
-- Pattern + Trend + Level + Momentum logic
-- Only high probability trades (>=70%)
-- Strict RIGA discipline rules
-- Real-time LTP via Angel One SmartAPI
-- Sniper entry system (Breakout + Retest)
+- BUY CE / BUY PE only
+- No SELL trades
+- Multi-timeframe structure analysis
+- Index structure engine
+- Premium candle engine
+- VWAP logic
+- Swing high / swing low breakout logic
+- Volume spike detection
+- Liquidity trap rejection
+- Structure-based SL
+- Sniper trade scoring system
+- ATM / Near ATM preference
+- One best trade selection
 
 -------------------------------------
 
 ## 📡 API ENDPOINTS
 
-- `/health` → Check backend status
-- `/ltp` → Get live market price
-- `/real-riga-signal` → Get BUY / SELL / NO TRADE signal
-- `/real-riga-scan` → Scan multiple stocks for sniper trades
+- `/health`
+- `/spot`
+- `/option-chain`
+- `/scan-options`
+- `/scan-all-options`
 
 -------------------------------------
 
-## ⚠️ RULES
+## ⚠️ RIGA RULES
 
-- Trade only if probability >= 70%
-- If not → return "NO TRADE"
-- Avoid fake breakouts
-- Entry only after candle close
-- Prefer retest entries
+- Only high probability trades
+- Reject fake breakouts
+- Reject weak candles
+- Reject wide SL
+- Reject bad RR
+- Avoid far OTM trades
+- Prefer ATM / near ATM
+- Final output:
+  - BUY_CE
+  - BUY_PE
+  - NO_TRADE
 
 -------------------------------------
 
@@ -45,18 +60,18 @@ uvicorn main:app --host 0.0.0.0 --port $PORT
 
 ## 🎯 GOAL
 
-Sniper trading system:
+Sniper option buying system:
 - Wait patiently
 - Avoid noise
-- Enter only high probability trades
-- Maximize accuracy
+- Catch strong momentum
+- High probability execution
+- Best trade from full market
 
 -------------------------------------
 
 ## ⚠️ NOTE
 
-- No auto order placement (signal only)
-- Uses Angel One API
+- Signal only
+- No auto order placement
+- Uses Angel One SmartAPI
 - Requires valid API credentials
-
--------------------------------------
