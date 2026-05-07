@@ -1379,6 +1379,79 @@ if FastAPI is not None:
     def scan_all_markets_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
         return scan_all_markets(token=token, strikes_around=strikes_around)
 
+    # Extra compatibility aliases for action/plugin path naming
+    @app.post("/scan-options")
+    def scan_options_dash(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.get("/scan-options")
+    def scan_options_dash_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/scan_options")
+    def scan_options_snake(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.get("/scan_options")
+    def scan_options_snake_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/scan/options")
+    def scan_options_slash(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.get("/scan/options")
+    def scan_options_slash_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/scan-all-markets")
+    def scan_all_markets_dash(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.get("/scan-all-markets")
+    def scan_all_markets_dash_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.post("/scan_all_markets")
+    def scan_all_markets_snake(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.get("/scan_all_markets")
+    def scan_all_markets_snake_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.post("/option-chain")
+    def get_option_chain_dash(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
+        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
+
+    @app.get("/option-chain")
+    def get_option_chain_dash_get(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
+        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/option_chain")
+    def get_option_chain_snake(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
+        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
+
+    @app.get("/option_chain")
+    def get_option_chain_snake_get(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
+        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/spot-price")
+    def get_spot_price_dash(index: str, token: str) -> Dict[str, Any]:
+        return get_spot_price(index=index, token=token)
+
+    @app.get("/spot-price")
+    def get_spot_price_dash_get(index: str, token: str) -> Dict[str, Any]:
+        return get_spot_price(index=index, token=token)
+
+    @app.post("/spot_price")
+    def get_spot_price_snake(index: str, token: str) -> Dict[str, Any]:
+        return get_spot_price(index=index, token=token)
+
+    @app.get("/spot_price")
+    def get_spot_price_snake_get(index: str, token: str) -> Dict[str, Any]:
+        return get_spot_price(index=index, token=token)
+
 
 # -----------------------------
 # Final output formatter
