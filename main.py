@@ -1003,6 +1003,71 @@ def _fetch_candles(
     return candles
 
 
+
+def _fetch_candles_with_fallbacks(
+    exchange: str,
+    token: str,
+    jwt_token: str,
+    interval: str,
+    lookback_minutes: int,
+) -> List[Dict[str, Any]]:
+    """
+    More robust candle fetch:
+    - first tries requested interval/lookback
+    - then tries longer lookback
+    - then tries common intraday intervals
+    """
+    attempts = [
+        (interval, lookback_minutes),
+        (interval, max(lookback_minutes, 390)),
+        ("THREE_MINUTE", max(lookback_minutes, 390)),
+        ("FIVE_MINUTE", max(lookback_minutes, 390)),
+        ("FIFTEEN_MINUTE", max(lookback_minutes, 390)),
+    ]
+
+    last_error: Optional[Exception] = None
+    for intrvl, lb in attempts:
+        try:
+            candles = _fetch_candles(
+                exchange=exchange,
+                token=token,
+                jwt_token=jwt_token,
+                interval=intrvl,
+                lookback_minutes=lb,
+            )
+            if len(candles) >= MIN_CANDLES:
+                return candles
+            if candles:
+                last_error = RuntimeError(f"Only {len(candles)} candles for {exchange}:{token} {intrvl}")
+        except Exception as exc:
+            last_error = exc
+
+    if last_error:
+        raise last_error
+    return []
+
+
+def _pseudo_index_candles_from_spot(spot: float, count: int = 8) -> List[Dict[str, Any]]:
+    """
+    Emergency fallback only to avoid route failure when Angel index candles are unavailable.
+    These candles are intentionally neutral, so RIGA will normally return NO TRADE unless
+    option-side data provides overwhelming confirmation in future custom logic.
+    """
+    candles: List[Dict[str, Any]] = []
+    base_time = now_ist() - timedelta(minutes=count)
+    for i in range(count):
+        candles.append(
+            {
+                "time": (base_time + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
+                "open": float(spot),
+                "high": float(spot),
+                "low": float(spot),
+                "close": float(spot),
+                "volume": 0.0,
+            }
+        )
+    return candles
+
 def _find_option_candidates(
     index: str,
     atm: float,
@@ -1139,33 +1204,44 @@ def fetch_market_data(index: str, token: str, strikes_around: int = 2) -> ScanPa
     interval = os.getenv("RIGA_CANDLE_INTERVAL", "ONE_MINUTE")
     lookback_minutes = int(os.getenv("RIGA_LOOKBACK_MINUTES", "90"))
 
-    index_candles = _fetch_candles(
-        exchange=cfg["spot_exchange"],
-        token=cfg["spot_token"],
-        jwt_token=jwt_token,
-        interval=interval,
-        lookback_minutes=lookback_minutes,
-    )
+    spot_ltp = _index_spot_from_quote(index, jwt_token)
+
+    try:
+        index_candles = _fetch_candles_with_fallbacks(
+            exchange=cfg["spot_exchange"],
+            token=cfg["spot_token"],
+            jwt_token=jwt_token,
+            interval=interval,
+            lookback_minutes=lookback_minutes,
+        )
+    except Exception:
+        index_candles = []
+
+    if spot_ltp is None and index_candles:
+        spot_ltp = index_candles[-1]["close"]
+
+    if spot_ltp is None:
+        raise RuntimeError(f"Spot quote and index candles unavailable for {index}")
 
     if len(index_candles) < MIN_CANDLES:
-        raise RuntimeError(f"Not enough index candles fetched for {index}")
-
-    spot_ltp = _index_spot_from_quote(index, jwt_token)
-    if spot_ltp is None:
-        spot_ltp = index_candles[-1]["close"]
+        # Do not crash the scanner. Use neutral pseudo candles and let RIGA return NO TRADE.
+        index_candles = _pseudo_index_candles_from_spot(float(spot_ltp), count=MIN_CANDLES)
 
     atm = _round_to_step(float(spot_ltp), int(cfg["step"]))
     candidates = _find_option_candidates(index=index, atm=atm, strikes_around=strikes_around)
 
     options: List[OptionCandidate] = []
     for c in candidates:
-        option_candles = _fetch_candles(
-            exchange=c["exchange"],
-            token=c["token"],
-            jwt_token=jwt_token,
-            interval=interval,
-            lookback_minutes=lookback_minutes,
-        )
+        try:
+            option_candles = _fetch_candles_with_fallbacks(
+                exchange=c["exchange"],
+                token=c["token"],
+                jwt_token=jwt_token,
+                interval=interval,
+                lookback_minutes=lookback_minutes,
+            )
+        except Exception:
+            option_candles = []
 
         if len(option_candles) < MIN_CANDLES:
             continue
