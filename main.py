@@ -29,6 +29,7 @@ import hmac
 import hashlib
 import struct
 from datetime import datetime, timedelta
+from pathlib import Path
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -1211,6 +1212,172 @@ if FastAPI is not None:
             raise HTTPException(status_code=501, detail=str(exc))
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/health")
+    def health() -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "server_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "routes": [
+                "/scan-live/{index}",
+                "/scanOptions",
+                "/getOptionChain",
+                "/scanAllMarkets",
+                "/getSpotPrice",
+            ],
+        }
+
+    @app.get("/scan-live/{index}")
+    def scan_live_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        try:
+            payload = fetch_market_data(index=index, token=token, strikes_around=strikes_around)
+            return scan_payload(payload)
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.post("/getSpotPrice")
+    def get_spot_price(index: str, token: str) -> Dict[str, Any]:
+        try:
+            index = index.upper().strip()
+            if index not in INDEX_CONFIG:
+                raise RuntimeError(f"Unsupported index: {index}")
+            jwt_token = _resolve_jwt_token(token)
+            spot = _index_spot_from_quote(index, jwt_token)
+            if spot is None:
+                cfg = INDEX_CONFIG[index]
+                candles = _fetch_candles(
+                    exchange=cfg["spot_exchange"],
+                    token=cfg["spot_token"],
+                    jwt_token=jwt_token,
+                    interval=os.getenv("RIGA_CANDLE_INTERVAL", "ONE_MINUTE"),
+                    lookback_minutes=20,
+                )
+                if not candles:
+                    raise RuntimeError("No candles available for fallback spot")
+                spot = candles[-1]["close"]
+            return {"index": index, "spot_ltp": float(spot)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/getSpotPrice")
+    def get_spot_price_get(index: str, token: str) -> Dict[str, Any]:
+        return get_spot_price(index=index, token=token)
+
+    @app.post("/getOptionChain")
+    def get_option_chain(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
+        try:
+            index = index.upper().strip()
+            if index not in INDEX_CONFIG:
+                raise RuntimeError(f"Unsupported index: {index}")
+            jwt_token = _resolve_jwt_token(token)
+            spot = _index_spot_from_quote(index, jwt_token)
+            if spot is None:
+                cfg = INDEX_CONFIG[index]
+                candles = _fetch_candles(
+                    exchange=cfg["spot_exchange"],
+                    token=cfg["spot_token"],
+                    jwt_token=jwt_token,
+                    interval=os.getenv("RIGA_CANDLE_INTERVAL", "ONE_MINUTE"),
+                    lookback_minutes=20,
+                )
+                if not candles:
+                    raise RuntimeError("No candles available for fallback spot")
+                spot = candles[-1]["close"]
+
+            atm = _round_to_step(float(spot), int(INDEX_CONFIG[index]["step"]))
+            candidates = _find_option_candidates(index=index, atm=atm, strikes_around=strikes_around)
+            options = [
+                {
+                    "exchange": c["exchange"],
+                    "tradingsymbol": c["symbol"],
+                    "symboltoken": c["token"],
+                    "strike": c["strike"],
+                    "type": c["type"],
+                    "expiry": c["expiry"],
+                }
+                for c in candidates
+            ]
+            return {
+                "index": index,
+                "spot": {"ltp": float(spot)},
+                "atm": float(atm),
+                "nearest_expiry": options[0]["expiry"] if options else None,
+                "options_count": len(options),
+                "options": options,
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/getOptionChain")
+    def get_option_chain_get(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
+        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/scanOptions")
+    def scan_options(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        try:
+            payload = fetch_market_data(index=index, token=token, strikes_around=strikes_around)
+            result = scan_payload(payload)
+            best = result.get("best_trade")
+            return {
+                "index": result.get("index"),
+                "spot_ltp": result.get("spot_ltp"),
+                "atm": result.get("atm"),
+                "index_bias": result.get("index_bias"),
+                "trade_count": result.get("trade_count", 0),
+                "best_trade": best,
+                "trades": [
+                    s for s in result.get("signals", [])
+                    if s.get("decision") in ["BUY_CE", "BUY_PE"]
+                ],
+                "all_signals": result.get("signals", []),
+                "formatted": format_riga_output(result),
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/scanOptions")
+    def scan_options_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_options(index=index, token=token, strikes_around=strikes_around)
+
+    @app.post("/scanAllMarkets")
+    def scan_all_markets(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        results: Dict[str, Any] = {}
+        valid_trades: List[Dict[str, Any]] = []
+
+        for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
+            try:
+                res = scan_options(index=idx, token=token, strikes_around=strikes_around)
+                results[idx] = res
+                best = res.get("best_trade")
+                if isinstance(best, dict) and best.get("decision") in ["BUY_CE", "BUY_PE"]:
+                    valid_trades.append(best)
+            except Exception as exc:
+                results[idx] = {"index": idx, "best_trade": "NO TRADE", "error": str(exc)}
+
+        if not valid_trades:
+            return {
+                "best_trade": "NO TRADE",
+                "trade_count": 0,
+                "results": results,
+            }
+
+        best = sorted(
+            valid_trades,
+            key=lambda x: (x.get("confidence", 0), -x.get("risk_pct", 999)),
+            reverse=True,
+        )[0]
+
+        return {
+            "best_trade": best,
+            "trade_count": len(valid_trades),
+            "results": results,
+        }
+
+    @app.get("/scanAllMarkets")
+    def scan_all_markets_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
 
 
 # -----------------------------
