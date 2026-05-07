@@ -772,7 +772,14 @@ def _generate_totp(secret: str, interval: int = 30, digits: int = 6) -> str:
     if not secret:
         raise RuntimeError("ANGEL_TOTP_SECRET missing. Set it in environment variables.")
 
-    key = base64.b32decode(secret.replace(" ", "").upper(), casefold=True)
+    normalized_secret = secret.replace(" ", "").upper()
+    # Base32 strings sometimes come from env without "=" padding.
+    # Python's b32decode requires correct padding length.
+    missing_padding = len(normalized_secret) % 8
+    if missing_padding:
+        normalized_secret += "=" * (8 - missing_padding)
+
+    key = base64.b32decode(normalized_secret, casefold=True)
     counter = int(time.time() // interval)
     msg = struct.pack(">Q", counter)
     digest = hmac.new(key, msg, hashlib.sha1).digest()
@@ -1418,6 +1425,22 @@ if FastAPI is not None:
 
     @app.get("/scan_all_markets")
     def scan_all_markets_snake_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.post("/scanallmarkets")
+    def scan_all_markets_lower(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.get("/scanallmarkets")
+    def scan_all_markets_lower_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.post("/scan-all")
+    def scan_all_short(token: str, strikes_around: int = 2) -> Dict[str, Any]:
+        return scan_all_markets(token=token, strikes_around=strikes_around)
+
+    @app.get("/scan-all")
+    def scan_all_short_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
         return scan_all_markets(token=token, strikes_around=strikes_around)
 
     @app.post("/option-chain")
