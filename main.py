@@ -26,7 +26,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.1")
+app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.2")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -172,6 +172,82 @@ def candle_window_ist():
         return start, end
 
     return start, n
+
+
+def market_session_status() -> Dict[str, Any]:
+    """
+    Prevent stale Friday/previous-day candles being treated as live scans.
+    Does not handle NSE/BSE holidays, but catches weekends and pre/post-market.
+    """
+    n = now_ist()
+    today_open = n.replace(hour=9, minute=15, second=0, microsecond=0)
+    today_close = n.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    is_weekend = n.weekday() >= 5
+    is_open = (not is_weekend) and today_open <= n <= today_close
+
+    if is_weekend:
+        status = "MARKET_CLOSED_WEEKEND"
+    elif n < today_open:
+        status = "MARKET_NOT_OPEN_YET"
+    elif n > today_close:
+        status = "MARKET_CLOSED_AFTER_HOURS"
+    else:
+        status = "MARKET_OPEN"
+
+    return {
+        "status": status,
+        "is_open": is_open,
+        "server_time_ist": n.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "today_open_ist": today_open.strftime("%Y-%m-%d %H:%M:%S IST"),
+        "today_close_ist": today_close.strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
+
+
+def parse_candle_time(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+
+    s = str(value)
+    # Angel often returns ISO like 2026-05-08T15:25:00+05:30
+    try:
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST)
+        return dt.astimezone(IST)
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s[:19], fmt).replace(tzinfo=IST)
+        except Exception:
+            continue
+
+    return None
+
+
+def is_candle_data_fresh(candles: List[Dict[str, Any]], max_stale_minutes: int = 20) -> Tuple[bool, str]:
+    """
+    During market hours, last candle must be close to current IST time.
+    Off-market, scans should not generate trades.
+    """
+    session = market_session_status()
+    if not session["is_open"]:
+        return False, session["status"]
+
+    if not candles:
+        return False, "NO_CANDLES"
+
+    last_dt = parse_candle_time(candles[-1].get("time"))
+    if not last_dt:
+        return False, "CANDLE_TIME_PARSE_FAILED"
+
+    age_min = (now_ist() - last_dt).total_seconds() / 60.0
+    if age_min > max_stale_minutes:
+        return False, f"STALE_CANDLE_DATA_{round(age_min, 1)}_MIN_OLD"
+
+    return True, "FRESH"
 
 
 def normalize_interval(interval: str) -> str:
@@ -910,10 +986,32 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     hist_token = spot_item.get("hist_token", spot_item["symboltoken"])
     index_candles = get_candles(client, spot_item["exchange"], hist_token, interval=interval)
 
+    fresh, freshness_reason = is_candle_data_fresh(index_candles)
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
+
+    if not fresh:
+        return {
+            "index": index,
+            "spot_ltp": spot_data["ltp"],
+            "spot_close": spot_data.get("close"),
+            "index_bias": {
+                "bias": "MARKET_CLOSED" if "MARKET_" in freshness_reason else "STALE_DATA",
+                "option_side": None,
+                "score": 0,
+                "candle_count": len(index_candles or []),
+                "last_candle": index_candles[-1] if index_candles else None,
+                "reason": freshness_reason,
+                "index": index,
+            },
+            "atm": atm,
+            "nearest_expiry": expiry,
+            "total_options_scanned": 0,
+            "trade_count": 0,
+            "best_trade": "NO TRADE",
+        }
+
     index_bias = analyze_index_structure(index, spot_data, index_candles)
     index_bias["index"] = index
-
-    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
 
     side = index_bias.get("option_side")
     if side not in ["CE", "PE"]:
@@ -988,7 +1086,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "10.1",
+        "version": "10.2",
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
@@ -999,6 +1097,7 @@ def health():
     return {
         "status": "ok",
         "server_time": now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        "market_session": market_session_status(),
         "routes": [
             "/getSpotPrice",
             "/getOptionChain",
