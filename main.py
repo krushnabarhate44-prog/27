@@ -41,7 +41,7 @@ RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN", "")
 
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-CONFIDENCE_MIN = 85
+CONFIDENCE_MIN = 80
 MAX_RISK_PCT = 22.0
 MIN_RISK_PCT = 2.0
 DEFAULT_BUFFER_PCT = 0.015
