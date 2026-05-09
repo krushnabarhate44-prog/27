@@ -26,7 +26,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.0")
+app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.1")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -41,7 +41,7 @@ RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN", "")
 
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-CONFIDENCE_MIN = 80
+CONFIDENCE_MIN = 85
 MAX_RISK_PCT = 22.0
 MIN_RISK_PCT = 2.0
 DEFAULT_BUFFER_PCT = 0.015
@@ -340,19 +340,35 @@ def is_bear_candle(c):
 
 
 def calc_vwap(candles: List[Dict[str, Any]]):
+    """
+    VWAP with fallback.
+
+    Angel index candles often return volume = 0.
+    In that case real VWAP cannot be calculated, so we use
+    typical-price average as a practical structure reference.
+    """
+    if not candles:
+        return None
+
     total_pv = 0.0
     total_v = 0.0
+    typical_prices = []
 
     for c in candles:
         tp = (c["high"] + c["low"] + c["close"]) / 3
+        typical_prices.append(tp)
+
         v = c.get("volume", 0) or 0
-        total_pv += tp * v
-        total_v += v
+        if v > 0:
+            total_pv += tp * v
+            total_v += v
 
-    if total_v <= 0:
-        return None
+    if total_v > 0:
+        return total_pv / total_v
 
-    return total_pv / total_v
+    # Fallback when all volumes are zero.
+    # Not true VWAP, but better than null for trend/acceptance logic.
+    return sum(typical_prices) / len(typical_prices)
 
 
 def find_swing_levels(candles: List[Dict[str, Any]], lookback: int = 20):
@@ -372,18 +388,31 @@ def find_swing_levels(candles: List[Dict[str, Any]], lookback: int = 20):
 
 
 def volume_spike(candles: List[Dict[str, Any]], lookback: int = 20):
+    """
+    Returns:
+    - spike_bool
+    - ratio
+    - available_bool
+
+    Angel index candles may have volume = 0.
+    If volume is unavailable, do not fail the setup; just mark unavailable.
+    """
     if len(candles) < 5:
-        return False, 0.0
+        return False, 0.0, False
 
     last_v = candles[-1].get("volume", 0) or 0
     prev_vols = [c.get("volume", 0) or 0 for c in candles[-lookback - 1:-1]]
-    base = avg(prev_vols)
+    positive_prev = [v for v in prev_vols if v > 0]
 
+    if last_v <= 0 or not positive_prev:
+        return False, 0.0, False
+
+    base = avg(positive_prev)
     if base <= 0:
-        return False, 0.0
+        return False, 0.0, False
 
     ratio = last_v / base
-    return ratio >= 1.25, round(ratio, 2)
+    return ratio >= 1.25, round(ratio, 2), True
 
 
 def classify_candle(c):
@@ -532,7 +561,7 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
     last = candles[-1]
     levels = find_swing_levels(candles, 20)
     vwap = calc_vwap(candles)
-    vol_ok, vol_ratio = volume_spike(candles)
+    vol_ok, vol_ratio, vol_available = volume_spike(candles)
 
     last_close = last["close"]
     prev_close = candles[-2]["close"]
@@ -604,6 +633,7 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
         "candle_count": len(candles),
         "last_candle": last,
         "trap": trap_reason if trap else "no trap",
+        "volume_available": vol_available,
     }
 
     if score_bull >= 55 and score_bull > score_bear:
@@ -656,7 +686,7 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     last = candles[-1]
     levels = find_swing_levels(candles, 20)
     vwap = calc_vwap(candles)
-    vol_ok, vol_ratio = volume_spike(candles)
+    vol_ok, vol_ratio, vol_available = volume_spike(candles)
 
     entry = float(ltp_data["ltp"])
     score = 0
@@ -836,6 +866,7 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         "momentum_pct": round(mom, 2),
         "premium_vwap": round(vwap, 2) if vwap else None,
         "volume_spike": vol_ratio if vol_ok else None,
+        "volume_available": vol_available,
         "atm_distance": atm_distance,
         "trap_filter": trap_reason,
         "candle_count": len(candles),
@@ -957,7 +988,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "10.0",
+        "version": "10.1",
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
