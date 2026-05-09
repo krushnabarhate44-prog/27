@@ -1,1585 +1,1221 @@
 """
-RIGA AI - Final main.py
-Book-based option buying scanner logic
+RIGA AI - Final main.py v10
+Book/PDF-based option buying scanner with Angel One SmartAPI
 
-IMPORTANT:
+Rules:
 - Final trades are OPTION BUYING only.
-- Bullish bias  -> BUY CE
-- Bearish bias  -> BUY PE
-- No option selling / writing / shorting.
-- Entry, SL, and targets are calculated on OPTION PREMIUM.
-- No clean retest hold / invalid RR / wide SL / confidence < 70 => NO TRADE.
-
-This file is designed as a drop-in FastAPI backend core.
-Connect your broker/data provider inside `fetch_market_data()` if you want live scans.
-You can also POST raw candles to `/scan` for direct RIGA analysis.
+- Bullish index bias  -> BUY_CE
+- Bearish index bias  -> BUY_PE
+- No SELL / SHORT / writing output.
+- Entry, SL, targets are on OPTION PREMIUM.
+- Uses candle structure, swing breakout, VWAP, volume expansion, trap filter,
+  exhaustion/chase filter, ATM preference, risk cap.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
 import os
-import math
-import json
-import time
 import requests
-import base64
-import hmac
-import hashlib
-import struct
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-try:
-    from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel, Field
-except Exception:  # keeps analysis functions importable even if FastAPI is not installed
-    FastAPI = None
-    HTTPException = Exception
-    BaseModel = object
-    Field = lambda default=None, **kwargs: default  # type: ignore
+import pyotp
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException, Query
+from SmartApi import SmartConnect
 
+load_dotenv()
+
+app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.0")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
-Decision = Literal["BUY_CE", "BUY_PE", "NO_TRADE"]
 
+IST = timezone(timedelta(hours=5, minutes=30))
 
-# -----------------------------
-# Config
-# -----------------------------
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
+ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
+ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD")
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
+RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN", "")
 
-CONFIDENCE_MIN = 70
-MAX_RISK_PCT = 15.0
-DEFAULT_BUFFER_PCT = 0.015  # 1.5% premium buffer below swing low
+SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+
+CONFIDENCE_MIN = 85
+MAX_RISK_PCT = 22.0
+MIN_RISK_PCT = 2.0
+DEFAULT_BUFFER_PCT = 0.015
 MIN_CANDLES = 8
 
+client_obj = None
+scrip_master_cache = None
 
 
-def now_ist() -> datetime:
-    """Render server may run in UTC; Angel historical API expects IST timestamps."""
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
-
-
-# -----------------------------
-# API Models
-# -----------------------------
-
-class Candle(BaseModel):
-    time: Optional[str] = None
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float = 0.0
-
-
-class OptionCandidate(BaseModel):
-    symbol: str
-    strike: float
-    type: Side
-    expiry: Optional[str] = None
-    candles: List[Candle]
-    ltp: Optional[float] = None
-
-
-class ScanPayload(BaseModel):
-    index: str = Field(..., description="NIFTY / BANKNIFTY / FINNIFTY / SENSEX")
-    spot_ltp: Optional[float] = None
-    atm: Optional[float] = None
-    index_candles: List[Candle]
-    options: List[OptionCandidate]
-    strikes_around: int = 2
-
-
-# -----------------------------
-# Utility
-# -----------------------------
-
-def as_dict(c: Any) -> Dict[str, float]:
-    """Accepts pydantic Candle, dataclass, or dict."""
-    if isinstance(c, dict):
-        return c
-    if hasattr(c, "model_dump"):
-        return c.model_dump()
-    if hasattr(c, "dict"):
-        return c.dict()
-    return {
-        "open": c.open,
-        "high": c.high,
-        "low": c.low,
-        "close": c.close,
-        "volume": getattr(c, "volume", 0.0),
-    }
-
-
-def safe_round(value: Optional[float], ndigits: int = 2) -> Optional[float]:
-    if value is None:
-        return None
-    return round(float(value), ndigits)
-
-
-def ema(values: List[float], period: int) -> Optional[float]:
-    if len(values) < period:
-        return None
-    k = 2 / (period + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-
-def vwap(candles: List[Any]) -> Optional[float]:
-    total_pv = 0.0
-    total_vol = 0.0
-    for c in candles:
-        d = as_dict(c)
-        vol = float(d.get("volume") or 0)
-        if vol <= 0:
-            continue
-        typical = (d["high"] + d["low"] + d["close"]) / 3
-        total_pv += typical * vol
-        total_vol += vol
-    if total_vol <= 0:
-        return None
-    return total_pv / total_vol
-
-
-def recent_swing_high(candles: List[Any], lookback: int = 8) -> Optional[float]:
-    if not candles:
-        return None
-    data = [as_dict(c) for c in candles[-lookback:]]
-    return max(d["high"] for d in data)
-
-
-def recent_swing_low(candles: List[Any], lookback: int = 8) -> Optional[float]:
-    if not candles:
-        return None
-    data = [as_dict(c) for c in candles[-lookback:]]
-    return min(d["low"] for d in data)
-
-
-def day_high(candles: List[Any]) -> Optional[float]:
-    if not candles:
-        return None
-    return max(as_dict(c)["high"] for c in candles)
-
-
-def day_low(candles: List[Any]) -> Optional[float]:
-    if not candles:
-        return None
-    return min(as_dict(c)["low"] for c in candles)
-
-
-def body_strength_pct(candle: Any) -> float:
-    d = as_dict(candle)
-    rng = d["high"] - d["low"]
-    if rng <= 0:
-        return 0.0
-    return abs(d["close"] - d["open"]) / rng
-
-
-def candle_quality(candle: Any) -> str:
-    pct = body_strength_pct(candle)
-    if pct >= 0.70:
-        return "A_PLUS"
-    if pct >= 0.50:
-        return "A"
-    if pct >= 0.35:
-        return "B"
-    return "WEAK"
-
-
-def candle_direction(candle: Any) -> Bias:
-    d = as_dict(candle)
-    if d["close"] > d["open"]:
-        return "BULLISH"
-    if d["close"] < d["open"]:
-        return "BEARISH"
-    return "NEUTRAL"
-
-
-def detect_candlestick_pattern(candles: List[Any]) -> str:
-    """Simple candle recognition for decision filtering; expand as needed."""
-    if not candles:
-        return "none"
-
-    last = as_dict(candles[-1])
-    q = candle_quality(last)
-    direction = candle_direction(last)
-    rng = last["high"] - last["low"]
-    body = abs(last["close"] - last["open"])
-
-    if rng <= 0:
-        return "none"
-
-    upper_wick = last["high"] - max(last["open"], last["close"])
-    lower_wick = min(last["open"], last["close"]) - last["low"]
-
-    # Doji / indecision
-    if body / rng <= 0.15:
-        return "doji"
-
-    # Single candle patterns
-    if lower_wick >= body * 2 and upper_wick <= body * 0.6:
-        return "hammer" if direction == "BULLISH" else "hanging_man"
-    if upper_wick >= body * 2 and lower_wick <= body * 0.6:
-        return "shooting_star" if direction == "BEARISH" else "inverted_hammer"
-    if q in ["A_PLUS", "A"] and upper_wick <= rng * 0.1 and lower_wick <= rng * 0.1:
-        return "bullish_marubozu" if direction == "BULLISH" else "bearish_marubozu"
-
-    # Two candle patterns
-    if len(candles) >= 2:
-        prev = as_dict(candles[-2])
-        prev_dir = candle_direction(prev)
-        last_body_low = min(last["open"], last["close"])
-        last_body_high = max(last["open"], last["close"])
-        prev_body_low = min(prev["open"], prev["close"])
-        prev_body_high = max(prev["open"], prev["close"])
-
-        if (
-            prev_dir == "BEARISH"
-            and direction == "BULLISH"
-            and last_body_low <= prev_body_low
-            and last_body_high >= prev_body_high
-        ):
-            return "bullish_engulfing"
-
-        if (
-            prev_dir == "BULLISH"
-            and direction == "BEARISH"
-            and last_body_low <= prev_body_low
-            and last_body_high >= prev_body_high
-        ):
-            return "bearish_engulfing"
-
-        if direction == "BULLISH" and prev_dir == "BEARISH":
-            prev_mid = (prev["open"] + prev["close"]) / 2
-            if last["close"] > prev_mid:
-                return "piercing_line"
-
-        if direction == "BEARISH" and prev_dir == "BULLISH":
-            prev_mid = (prev["open"] + prev["close"]) / 2
-            if last["close"] < prev_mid:
-                return "dark_cloud_cover"
-
-    return "none"
-
-
-# -----------------------------
-# Book Knowledge Engine
-# -----------------------------
-
-def detect_index_bias(index_candles: List[Any]) -> Tuple[Bias, int, List[str]]:
-    reasons: List[str] = []
-    if len(index_candles) < MIN_CANDLES:
-        return "NEUTRAL", 0, ["not enough index candles"]
-
-    data = [as_dict(c) for c in index_candles]
-    closes = [d["close"] for d in data]
-    last = data[-1]
-    prev = data[-2]
-    q = candle_quality(last)
-    dirn = candle_direction(last)
-
-    score = 0
-
-    ema9 = ema(closes, min(9, len(closes)))
-    ema21 = ema(closes, min(21, len(closes)))
-
-    swing_hi = recent_swing_high(data[:-1], lookback=8)
-    swing_lo = recent_swing_low(data[:-1], lookback=8)
-    vw = vwap(data)
-
-    # Bullish conditions
-    bullish_points = 0
-    bearish_points = 0
-
-    if ema9 is not None and ema21 is not None:
-        if ema9 > ema21:
-            bullish_points += 20
-            reasons.append("EMA momentum bullish")
-        elif ema9 < ema21:
-            bearish_points += 20
-            reasons.append("EMA momentum bearish")
-
-    if swing_hi is not None and last["close"] > swing_hi:
-        bullish_points += 25
-        reasons.append("index breakout above swing high")
-
-    if swing_lo is not None and last["close"] < swing_lo:
-        bearish_points += 25
-        reasons.append("index breakdown below swing low")
-
-    if dirn == "BULLISH" and q in ["A_PLUS", "A"]:
-        bullish_points += 20
-        reasons.append(f"last index candle {q} bullish")
-    elif dirn == "BEARISH" and q in ["A_PLUS", "A"]:
-        bearish_points += 20
-        reasons.append(f"last index candle {q} bearish")
-    elif q == "WEAK":
-        reasons.append("weak body / indecision")
-
-    if vw is not None:
-        if last["close"] > vw:
-            bullish_points += 10
-            reasons.append("index above VWAP")
-        elif last["close"] < vw:
-            bearish_points += 10
-            reasons.append("index below VWAP")
-
-    # Follow-through check
-    if last["close"] > prev["close"]:
-        bullish_points += 10
-    elif last["close"] < prev["close"]:
-        bearish_points += 10
-
-    if bullish_points >= 55 and bullish_points > bearish_points:
-        return "BULLISH", min(bullish_points, 100), reasons
-
-    if bearish_points >= 55 and bearish_points > bullish_points:
-        return "BEARISH", min(bearish_points, 100), reasons
-
-    return "NEUTRAL", max(bullish_points, bearish_points), reasons or ["index structure not clean enough"]
-
-
-def breakout_level(option_candles: List[Any]) -> Optional[float]:
-    if len(option_candles) < 4:
-        return None
-    # breakout level is prior swing high of option premium
-    return recent_swing_high(option_candles[:-1], lookback=8)
-
-
-def is_breakout_confirmed(option_candles: List[Any]) -> bool:
-    if len(option_candles) < 4:
-        return False
-    last = as_dict(option_candles[-1])
-    level = breakout_level(option_candles)
-    if level is None:
-        return False
-    return last["close"] > level
-
-
-def is_retest_hold(option_candles: List[Any]) -> bool:
-    """
-    Book rule:
-    Breakout alone is not enough.
-    Premium should retest/throwback and hold breakout/support area.
-    """
-    if len(option_candles) < 5:
-        return False
-
-    data = [as_dict(c) for c in option_candles]
-    level = breakout_level(data[:-1]) or breakout_level(data)
-    if level is None:
-        return False
-
-    last = data[-1]
-    prev = data[-2]
-
-    # Retest hold: wick touches/comes near breakout level, close accepts above it
-    tolerance = max(level * 0.004, 0.5)
-    touched = last["low"] <= level + tolerance or prev["low"] <= level + tolerance
-    accepted = last["close"] > level and candle_direction(last) == "BULLISH"
-    return bool(touched and accepted)
-
-
-def detect_liquidity_trap(option_candles: List[Any]) -> bool:
-    if len(option_candles) < 4:
-        return False
-
-    data = [as_dict(c) for c in option_candles]
-    level = breakout_level(data)
-    if level is None:
-        return False
-
-    last = data[-1]
-    # False breakout: high crosses breakout, close falls back below breakout
-    if last["high"] > level and last["close"] < level:
-        return True
-
-    # Day high rejection trap
-    dh = day_high(data[:-1])
-    if dh is not None:
-        upper_rejection = last["high"] >= dh and last["close"] < (last["open"] + last["high"]) / 2
-        weak = candle_quality(last) == "WEAK" or detect_candlestick_pattern(data) in ["shooting_star", "doji"]
-        if upper_rejection and weak:
-            return True
-
-    return False
-
-
-def option_premium_alignment(
-    option_candles: List[Any],
-    required_side: Side,
-) -> Tuple[bool, List[str], int]:
-    """
-    Option buying alignment:
-    - Bullish setup requires ATM/near-ATM CE premium strength.
-    - Bearish setup requires ATM/near-ATM PE premium strength.
-    - Reject day-low/decay mode.
-    """
-    reasons: List[str] = []
-    score = 0
-
-    if len(option_candles) < MIN_CANDLES:
-        return False, ["not enough option candles"], score
-
-    data = [as_dict(c) for c in option_candles]
-    last = data[-1]
-    closes = [d["close"] for d in data]
-    q = candle_quality(last)
-    pattern = detect_candlestick_pattern(data)
-    vw = vwap(data)
-    dh = day_high(data)
-    dl = day_low(data)
-
-    if candle_direction(last) == "BULLISH" and q in ["A_PLUS", "A", "B"]:
-        score += 20
-        reasons.append(f"{required_side} premium bullish candle quality {q}")
-    else:
-        reasons.append(f"{required_side} premium candle not strong")
-
-    if pattern in [
-        "bullish_engulfing",
-        "hammer",
-        "inverted_hammer",
-        "piercing_line",
-        "bullish_marubozu",
-    ]:
-        score += 15
-        reasons.append(f"{required_side} premium bullish candle pattern: {pattern}")
-
-    if vw is not None and last["close"] > vw:
-        score += 15
-        reasons.append(f"{required_side} premium above VWAP")
-
-    if is_breakout_confirmed(data):
-        score += 20
-        reasons.append(f"{required_side} premium breakout confirmed")
-
-    if is_retest_hold(data):
-        score += 25
-        reasons.append(f"{required_side} premium retest/throwback hold confirmed")
-
-    # Avoid day-high chase if no retest
-    if dh is not None and last["close"] >= dh * 0.995 and not is_retest_hold(data):
-        reasons.append(f"{required_side} premium near day high without retest hold")
-        score -= 25
-
-    # Reject decay / day-low area
-    if dl is not None and last["close"] <= dl * 1.02:
-        reasons.append(f"{required_side} premium near day low / decay mode")
-        score -= 30
-
-    # EMA premium momentum
-    e9 = ema(closes, min(9, len(closes)))
-    e21 = ema(closes, min(21, len(closes)))
-    if e9 is not None and e21 is not None and e9 > e21:
-        score += 10
-        reasons.append(f"{required_side} premium EMA momentum positive")
-
-    aligned = score >= 55
-    return aligned, reasons, max(0, min(score, 100))
-
-
-def calculate_structure_risk(option_candles: List[Any], entry: float) -> Dict[str, Any]:
-    swing_low = recent_swing_low(option_candles[:-1], lookback=8)
-    if swing_low is None:
-        return {"rr_valid": False, "reason": "missing swing low for structure SL"}
-
-    buffer_value = max(entry * DEFAULT_BUFFER_PCT, 0.5)
-    sl = round(swing_low - buffer_value, 2)
-    risk = round(entry - sl, 2)
-
-    if risk <= 0:
-        return {"rr_valid": False, "reason": "invalid structure SL"}
-
-    risk_pct = round((risk / entry) * 100, 2)
-
-    return {
-        "entry": round(entry, 2),
-        "structure_sl": sl,
-        "risk_points": risk,
-        "risk_pct": risk_pct,
-        "targets": {
-            "t1": round(entry + risk * 1.5, 2),
-            "t2": round(entry + risk * 2.0, 2),
-            "t3": round(entry + risk * 3.0, 2),
-        },
-        "rr_valid": True,
-    }
-
-
-def riga_book_filter(signal: Dict[str, Any]) -> Dict[str, Any]:
-    reject_reasons: List[str] = []
-
-    if signal.get("index_bias") not in ["BULLISH", "BEARISH"]:
-        reject_reasons.append("index bias not clean")
-
-    if not signal.get("breakout_confirmed"):
-        reject_reasons.append("pattern not activated / breakout not confirmed")
-
-    if not signal.get("retest_hold"):
-        reject_reasons.append("no retest hold")
-
-    if signal.get("trap_detected"):
-        reject_reasons.append("liquidity trap / failed breakout detected")
-
-    if signal.get("candle_quality") in ["WEAK", None]:
-        reject_reasons.append("weak option candle quality")
-
-    if signal.get("candle_pattern") in ["doji", "shooting_star", "hanging_man"]:
-        reject_reasons.append(f"option candle pattern against buying strength: {signal.get('candle_pattern')}")
-
-    if not signal.get("option_alignment"):
-        reject_reasons.append("option premium not aligned")
-
-    if not signal.get("rr_valid"):
-        reject_reasons.append("RR invalid")
-
-    if signal.get("risk_pct", 999) > MAX_RISK_PCT:
-        reject_reasons.append("SL too wide")
-
-    if signal.get("confidence", 0) < CONFIDENCE_MIN:
-        reject_reasons.append("confidence below 70")
-
-    if reject_reasons:
-        return {
-            "decision": "NO_TRADE",
-            "passed": False,
-            "reasons": reject_reasons,
-        }
-
-    return {
-        "decision": signal.get("option_trade"),
-        "passed": True,
-        "reasons": ["book knowledge filter passed"],
-    }
-
-
-def analyze_option_candidate(
-    index_name: str,
-    index_bias: Bias,
-    index_score: int,
-    index_reasons: List[str],
-    option: Any,
-) -> Dict[str, Any]:
-    option_data = option.model_dump() if hasattr(option, "model_dump") else option.dict() if hasattr(option, "dict") else option
-    opt_type: Side = option_data["type"]
-    candles = option_data["candles"]
-    data = [as_dict(c) for c in candles]
-
-    required_side: Optional[Side] = None
-    option_trade: Decision = "NO_TRADE"
-
-    if index_bias == "BULLISH":
-        required_side = "CE"
-        option_trade = "BUY_CE"
-    elif index_bias == "BEARISH":
-        required_side = "PE"
-        option_trade = "BUY_PE"
-
-    if required_side is None or opt_type != required_side:
-        return {
-            "index": index_name,
-            "symbol": option_data.get("symbol"),
-            "strike": option_data.get("strike"),
-            "type": opt_type,
-            "decision": "NO_TRADE",
-            "confidence": 0,
-            "reject_reasons": [f"wrong option side for {index_bias} bias"],
-        }
-
-    last = data[-1]
-    entry = float(option_data.get("ltp") or last["close"])
-    risk = calculate_structure_risk(data, entry)
-    aligned, alignment_reasons, alignment_score = option_premium_alignment(data, required_side)
-
-    breakout = is_breakout_confirmed(data)
-    retest = is_retest_hold(data)
-    trap = detect_liquidity_trap(data)
-    c_quality = candle_quality(last)
-    c_pattern = detect_candlestick_pattern(data)
-
-    confidence = int(
-        min(
-            100,
-            max(
-                0,
-                index_score * 0.35
-                + alignment_score * 0.45
-                + (15 if breakout else 0)
-                + (15 if retest else 0)
-                - (25 if trap else 0)
-                - (15 if c_quality == "WEAK" else 0)
-            ),
-        )
-    )
-
-    signal = {
-        "index": index_name,
-        "index_bias": index_bias,
-        "option_trade": option_trade,
-        "symbol": option_data.get("symbol"),
-        "strike": option_data.get("strike"),
-        "type": opt_type,
-        "expiry": option_data.get("expiry"),
-        "entry": safe_round(entry),
-        "stop_loss": risk.get("structure_sl"),
-        "target": risk.get("targets", {}).get("t2"),
-        "targets": risk.get("targets"),
-        "risk_points": risk.get("risk_points"),
-        "risk_pct": risk.get("risk_pct", 999),
-        "rr_valid": risk.get("rr_valid", False),
-        "breakout_confirmed": breakout,
-        "retest_hold": retest,
-        "trap_detected": trap,
-        "candle_pattern": c_pattern,
-        "candle_quality": c_quality,
-        "option_alignment": aligned,
-        "confidence": confidence,
-        "reason": ", ".join(index_reasons + alignment_reasons),
-    }
-
-    filter_result = riga_book_filter(signal)
-
-    if not filter_result["passed"]:
-        signal["decision"] = "NO_TRADE"
-        signal["reject_reasons"] = filter_result["reasons"]
-    else:
-        signal["decision"] = option_trade
-        signal["reject_reasons"] = []
-
-    signal["book_filter"] = {
-        "pattern_status": "retest" if retest else "breakout" if breakout else "forming",
-        "breakout_confirmed": breakout,
-        "retest_hold": retest,
-        "trap_detected": trap,
-        "candle_pattern": c_pattern,
-        "candle_quality": c_quality,
-        "option_alignment": aligned,
-        "sl_valid": bool(risk.get("rr_valid")) and signal["risk_pct"] <= MAX_RISK_PCT,
-        "rr_valid": risk.get("rr_valid", False),
-        "final_decision": signal["decision"],
-        "filter_reasons": filter_result["reasons"],
-    }
-
-    return signal
-
-
-def choose_best_trade(signals: List[Dict[str, Any]]) -> Dict[str, Any]:
-    valid = [s for s in signals if s.get("decision") in ["BUY_CE", "BUY_PE"]]
-    if not valid:
-        return {
-            "best_trade": "NO TRADE",
-            "trade_count": 0,
-            "signals": signals,
-        }
-    best = sorted(valid, key=lambda x: (x.get("confidence", 0), -x.get("risk_pct", 999)), reverse=True)[0]
-    return {
-        "best_trade": best,
-        "trade_count": len(valid),
-        "signals": signals,
-    }
-
-
-def scan_payload(payload: Any) -> Dict[str, Any]:
-    data = payload.model_dump() if hasattr(payload, "model_dump") else payload.dict() if hasattr(payload, "dict") else payload
-    index_candles = data["index_candles"]
-
-    index_bias, index_score, index_reasons = detect_index_bias(index_candles)
-
-    signals = []
-    for option in data["options"]:
-        signals.append(
-            analyze_option_candidate(
-                index_name=data["index"],
-                index_bias=index_bias,
-                index_score=index_score,
-                index_reasons=index_reasons,
-                option=option,
-            )
-        )
-
-    result = choose_best_trade(signals)
-    result.update(
-        {
-            "index": data["index"],
-            "spot_ltp": data.get("spot_ltp"),
-            "atm": data.get("atm"),
-            "index_bias": {
-                "bias": index_bias,
-                "score": index_score,
-                "reason": ", ".join(index_reasons),
-            },
-        }
-    )
-    return result
-
-
-# -----------------------------
-# Live data hook
-# -----------------------------
-
-# -----------------------------
-# Live Angel One SmartAPI Adapter
-# -----------------------------
-
+# One clean config only.
+# spot_token = LTP/quote token
+# hist_token = Angel historical candle token for index
 INDEX_CONFIG = {
     "NIFTY": {
-        "spot_symbol": "NIFTY 50",
-        "spot_exchange": "NSE",
-        "spot_token": "26000",
+        "spot": {"exchange": "NSE", "tradingsymbol": "NIFTY 50", "symboltoken": "26000", "hist_token": "99926000"},
         "option_exchange": "NFO",
-        "name_keywords": ["NIFTY"],
+        "option_name": "NIFTY",
         "step": 50,
     },
     "BANKNIFTY": {
-        "spot_symbol": "NIFTY BANK",
-        "spot_exchange": "NSE",
-        "spot_token": "26009",
+        "spot": {"exchange": "NSE", "tradingsymbol": "NIFTY BANK", "symboltoken": "26009", "hist_token": "99926009"},
         "option_exchange": "NFO",
-        "name_keywords": ["BANKNIFTY", "BANK NIFTY"],
+        "option_name": "BANKNIFTY",
         "step": 100,
     },
     "FINNIFTY": {
-        "spot_symbol": "NIFTY FIN SERVICE",
-        "spot_exchange": "NSE",
-        "spot_token": "26037",
+        "spot": {"exchange": "NSE", "tradingsymbol": "NIFTY FIN SERVICE", "symboltoken": "26037", "hist_token": "99926037"},
         "option_exchange": "NFO",
-        "name_keywords": ["FINNIFTY", "NIFTY FIN SERVICE"],
+        "option_name": "FINNIFTY",
         "step": 50,
     },
     "SENSEX": {
-        "spot_symbol": "SENSEX",
-        "spot_exchange": "BSE",
-        "spot_token": "1",
+        "spot": {"exchange": "BSE", "tradingsymbol": "SENSEX", "symboltoken": "1", "hist_token": "99919000"},
         "option_exchange": "BFO",
-        "name_keywords": ["SENSEX"],
+        "option_name": "SENSEX",
         "step": 100,
     },
 }
 
-ANGEL_HISTORICAL_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/historical/v1/getCandleData"
-ANGEL_QUOTE_URL = "https://apiconnect.angelone.in/rest/secure/angelbroking/market/v1/quote/"
-ANGEL_LOGIN_URL = "https://apiconnect.angelone.in/rest/auth/angelbroking/user/v1/loginByPassword"
-ANGEL_SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-SCRIP_CACHE_FILE = "/tmp/riga_angel_scrip_master.json"
-SCRIP_CACHE_TTL_SECONDS = 6 * 60 * 60
+
+# -----------------------------
+# Auth / Client
+# -----------------------------
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
 
-def _generate_totp(secret: str, interval: int = 30, digits: int = 6) -> str:
-    """
-    Generates TOTP without external dependency.
-    ANGEL_TOTP_SECRET should be the base32 secret from authenticator setup.
-    """
-    if not secret:
-        raise RuntimeError("ANGEL_TOTP_SECRET missing. Set it in environment variables.")
-
-    normalized_secret = secret.replace(" ", "").upper()
-    # Base32 strings sometimes come from env without "=" padding.
-    # Python's b32decode requires correct padding length.
-    missing_padding = len(normalized_secret) % 8
-    if missing_padding:
-        normalized_secret += "=" * (8 - missing_padding)
-
-    key = base64.b32decode(normalized_secret, casefold=True)
-    counter = int(time.time() // interval)
-    msg = struct.pack(">Q", counter)
-    digest = hmac.new(key, msg, hashlib.sha1).digest()
-    offset = digest[-1] & 0x0F
-    code = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
-    return str(code % (10 ** digits)).zfill(digits)
+def check_token(authorization: Optional[str], token: Optional[str]):
+    if not RIGA_ACTION_TOKEN:
+        return
+    if authorization == f"Bearer {RIGA_ACTION_TOKEN}":
+        return
+    if token == RIGA_ACTION_TOKEN:
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _base_headers() -> Dict[str, str]:
-    api_key = os.getenv("ANGEL_API_KEY", "").strip()
-    client_code = os.getenv("ANGEL_CLIENT_CODE", "").strip()
+def get_client():
+    global client_obj
 
-    if not api_key:
-        raise RuntimeError("ANGEL_API_KEY missing. Set it in Render environment variables.")
+    if client_obj:
+        return client_obj
 
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-PrivateKey": api_key,
-        "X-SourceID": "WEB",
-        "X-ClientLocalIP": os.getenv("ANGEL_CLIENT_LOCAL_IP", "127.0.0.1"),
-        "X-ClientPublicIP": os.getenv("ANGEL_CLIENT_PUBLIC_IP", "127.0.0.1"),
-        "X-MACAddress": os.getenv("ANGEL_MAC_ADDRESS", "00:00:00:00:00:00"),
-        "X-UserType": "USER",
-    }
+    if not all([ANGEL_API_KEY, ANGEL_CLIENT_CODE, ANGEL_PASSWORD, ANGEL_TOTP_SECRET]):
+        raise HTTPException(status_code=500, detail="Missing Angel credentials in Render/.env")
 
-    if client_code:
-        headers["X-ClientCode"] = client_code
+    client = SmartConnect(api_key=ANGEL_API_KEY)
 
-    return headers
+    totp = pyotp.TOTP(
+        ANGEL_TOTP_SECRET.strip().replace(" ", "").upper()
+    ).now()
 
-
-def _login_angel_and_get_jwt() -> str:
-    """
-    Logs into Angel One SmartAPI using env credentials and returns JWT.
-    Required Render env:
-    - ANGEL_API_KEY
-    - ANGEL_CLIENT_CODE
-    - ANGEL_PASSWORD
-    - ANGEL_TOTP_SECRET
-    """
-    client_code = os.getenv("ANGEL_CLIENT_CODE", "").strip()
-    password = os.getenv("ANGEL_PASSWORD", "").strip()
-    totp_secret = os.getenv("ANGEL_TOTP_SECRET", "").strip()
-
-    if not client_code:
-        raise RuntimeError("ANGEL_CLIENT_CODE missing.")
-    if not password:
-        raise RuntimeError("ANGEL_PASSWORD missing.")
-    if not totp_secret:
-        raise RuntimeError("ANGEL_TOTP_SECRET missing.")
-
-    payload = {
-        "clientcode": client_code,
-        "password": password,
-        "totp": _generate_totp(totp_secret),
-    }
-
-    response = requests.post(
-        ANGEL_LOGIN_URL,
-        headers=_base_headers(),
-        json=payload,
-        timeout=20,
+    session = client.generateSession(
+        ANGEL_CLIENT_CODE,
+        ANGEL_PASSWORD,
+        totp
     )
-    response.raise_for_status()
-    body = response.json()
 
-    if not body.get("status"):
-        raise RuntimeError(f"Angel login failed: {body}")
+    if not session or not session.get("status"):
+        raise HTTPException(status_code=500, detail=f"Angel login failed: {session}")
 
-    data = body.get("data") or {}
-    jwt = data.get("jwtToken") or data.get("jwt_token") or data.get("token")
-
-    if not jwt:
-        raise RuntimeError(f"Angel login response missing jwtToken: {body}")
-
-    return str(jwt)
+    client_obj = client
+    return client
 
 
-def _resolve_jwt_token(token: str) -> str:
+def load_scrip_master():
+    global scrip_master_cache
+
+    if scrip_master_cache:
+        return scrip_master_cache
+
+    res = requests.get(SCRIP_MASTER_URL, timeout=25)
+    res.raise_for_status()
+    scrip_master_cache = res.json()
+    return scrip_master_cache
+
+
+# -----------------------------
+# Time / Market Data
+# -----------------------------
+
+def last_trading_date(dt: datetime) -> datetime:
+    d = dt
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
+
+
+def candle_window_ist():
     """
-    Supports two modes:
-    1. token == RIGA_ACTION_TOKEN, e.g. Krushna123:
-       backend logs in to Angel using Render env vars and generates JWT.
-    2. token is already Angel JWT:
-       use it directly.
+    Render may run UTC. Angel historical API needs IST.
+    Uses 09:15 to now during market, or previous trading session after close/before open.
     """
-    incoming = (token or "").strip()
-    action_token = os.getenv("RIGA_ACTION_TOKEN", "").strip()
+    n = now_ist()
+    d = last_trading_date(n)
 
-    if action_token and incoming == action_token:
-        return _login_angel_and_get_jwt()
+    start = d.replace(hour=9, minute=15, second=0, microsecond=0)
+    end = d.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    env_jwt = os.getenv("ANGEL_JWT_TOKEN", "").strip()
-    if not incoming and env_jwt:
-        return env_jwt
+    if n < start:
+        d = last_trading_date(d - timedelta(days=1))
+        start = d.replace(hour=9, minute=15, second=0, microsecond=0)
+        end = d.replace(hour=15, minute=30, second=0, microsecond=0)
+        return start, end
 
-    if incoming:
-        return incoming
+    if n > end:
+        return start, end
 
-    raise RuntimeError("Token missing. Pass RIGA_ACTION_TOKEN or ANGEL JWT token.")
-
-
-def _angel_headers(jwt_token: str) -> Dict[str, str]:
-    headers = _base_headers()
-    headers["Authorization"] = f"Bearer {jwt_token}"
-    return headers
-
-def _load_scrip_master() -> List[Dict[str, Any]]:
-    """
-    Downloads and caches Angel One OpenAPI scrip master.
-    This is required to map ATM/near-ATM option symbols to symbol tokens.
-    """
-    cache = Path(SCRIP_CACHE_FILE)
-
-    if cache.exists() and time.time() - cache.stat().st_mtime < SCRIP_CACHE_TTL_SECONDS:
-        try:
-            return json.loads(cache.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-
-    response = requests.get(ANGEL_SCRIP_MASTER_URL, timeout=20)
-    response.raise_for_status()
-    data = response.json()
-    cache.write_text(json.dumps(data), encoding="utf-8")
-    return data
+    return start, n
 
 
-def _parse_expiry(value: Any) -> Optional[datetime]:
-    if value is None:
-        return None
+def normalize_interval(interval: str) -> str:
+    allowed = {
+        "ONE_MINUTE",
+        "THREE_MINUTE",
+        "FIVE_MINUTE",
+        "TEN_MINUTE",
+        "FIFTEEN_MINUTE",
+        "THIRTY_MINUTE",
+        "ONE_HOUR",
+        "ONE_DAY",
+    }
+    interval = (interval or "FIVE_MINUTE").upper()
+    return interval if interval in allowed else "FIVE_MINUTE"
 
-    s = str(value).strip().upper()
-    for fmt in ("%d%b%Y", "%d-%b-%Y", "%Y-%m-%d", "%d%b%y"):
-        try:
-            return datetime.strptime(s, fmt)
-        except Exception:
-            continue
-    return None
 
-
-def _normalize_strike(raw: Any) -> Optional[float]:
-    """
-    Angel master sometimes stores strikes scaled by 100.
-    This normalizer handles both formats.
-    """
+def get_ltp(client, item: Dict[str, Any]):
     try:
-        value = float(raw)
+        res = client.ltpData(item["exchange"], item["tradingsymbol"], str(item["symboltoken"]))
     except Exception:
         return None
 
-    if value > 100000:
-        value = value / 100.0
+    if not res or not res.get("status"):
+        return None
 
-    return value
-
-
-def _round_to_step(value: float, step: int) -> float:
-    return round(value / step) * step
-
-
-def _fetch_candles(
-    exchange: str,
-    token: str,
-    jwt_token: str,
-    interval: str = "ONE_MINUTE",
-    lookback_minutes: int = 90,
-) -> List[Dict[str, Any]]:
-    """
-    Fetches live historical candles from Angel One SmartAPI.
-    Output candle format:
-    [time, open, high, low, close, volume]
-    """
-    to_dt = now_ist()
-    from_dt = to_dt - timedelta(minutes=lookback_minutes)
-
-    payload = {
-        "exchange": exchange,
-        "symboltoken": str(token),
-        "interval": interval,
-        "fromdate": from_dt.strftime("%Y-%m-%d %H:%M"),
-        "todate": to_dt.strftime("%Y-%m-%d %H:%M"),
+    d = res.get("data", {}) or {}
+    return {
+        "symbol": item["tradingsymbol"],
+        "exchange": item["exchange"],
+        "token": str(item["symboltoken"]),
+        "ltp": d.get("ltp"),
+        "open": d.get("open"),
+        "high": d.get("high"),
+        "low": d.get("low"),
+        "close": d.get("close"),
     }
 
-    response = requests.post(
-        ANGEL_HISTORICAL_URL,
-        headers=_angel_headers(jwt_token),
-        json=payload,
-        timeout=20,
-    )
 
-    response.raise_for_status()
-    body = response.json()
+def get_candles(client, exchange: str, symboltoken: str, interval: str = "FIVE_MINUTE"):
+    interval = normalize_interval(interval)
+    start, end = candle_window_ist()
 
-    if not body.get("status"):
-        raise RuntimeError(f"Angel candle API error: {body}")
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(symboltoken),
+        "interval": interval,
+        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+        "todate": end.strftime("%Y-%m-%d %H:%M"),
+    }
 
-    rows = body.get("data") or []
-    candles: List[Dict[str, Any]] = []
+    try:
+        res = client.getCandleData(params)
+    except Exception:
+        return []
 
-    for row in rows:
-        if len(row) < 6:
-            continue
-        candles.append(
-            {
-                "time": str(row[0]),
+    if not res or not res.get("status"):
+        return []
+
+    candles = []
+    for row in res.get("data", []) or []:
+        try:
+            candles.append({
+                "time": row[0],
                 "open": float(row[1]),
                 "high": float(row[2]),
                 "low": float(row[3]),
                 "close": float(row[4]),
-                "volume": float(row[5] or 0),
-            }
-        )
+                "volume": float(row[5]) if len(row) > 5 and row[5] is not None else 0.0,
+            })
+        except Exception:
+            continue
 
     return candles
 
 
+def get_candles_debug(client, exchange: str, symboltoken: str, interval: str = "FIVE_MINUTE"):
+    interval = normalize_interval(interval)
+    start, end = candle_window_ist()
 
-def _fetch_candles_with_fallbacks(
-    exchange: str,
-    token: str,
-    jwt_token: str,
-    interval: str,
-    lookback_minutes: int,
-) -> List[Dict[str, Any]]:
-    """
-    More robust candle fetch:
-    - first tries requested interval/lookback
-    - then tries longer lookback
-    - then tries common intraday intervals
-    """
-    attempts = [
-        (interval, lookback_minutes),
-        (interval, max(lookback_minutes, 390)),
-        ("THREE_MINUTE", max(lookback_minutes, 390)),
-        ("FIVE_MINUTE", max(lookback_minutes, 390)),
-        ("FIFTEEN_MINUTE", max(lookback_minutes, 390)),
-    ]
-
-    last_error: Optional[Exception] = None
-    for intrvl, lb in attempts:
-        try:
-            candles = _fetch_candles(
-                exchange=exchange,
-                token=token,
-                jwt_token=jwt_token,
-                interval=intrvl,
-                lookback_minutes=lb,
-            )
-            if len(candles) >= MIN_CANDLES:
-                return candles
-            if candles:
-                last_error = RuntimeError(f"Only {len(candles)} candles for {exchange}:{token} {intrvl}")
-        except Exception as exc:
-            last_error = exc
-
-    if last_error:
-        raise last_error
-    return []
-
-
-def _pseudo_index_candles_from_spot(spot: float, count: int = 8) -> List[Dict[str, Any]]:
-    """
-    Emergency fallback only to avoid route failure when Angel index candles are unavailable.
-    These candles are intentionally neutral, so RIGA will normally return NO TRADE unless
-    option-side data provides overwhelming confirmation in future custom logic.
-    """
-    candles: List[Dict[str, Any]] = []
-    base_time = now_ist() - timedelta(minutes=count)
-    for i in range(count):
-        candles.append(
-            {
-                "time": (base_time + timedelta(minutes=i)).strftime("%Y-%m-%d %H:%M"),
-                "open": float(spot),
-                "high": float(spot),
-                "low": float(spot),
-                "close": float(spot),
-                "volume": 0.0,
-            }
-        )
-    return candles
-
-def _find_option_candidates(
-    index: str,
-    atm: float,
-    strikes_around: int,
-) -> List[Dict[str, Any]]:
-    """
-    Finds ATM/near-ATM CE/PE option contracts from Angel scrip master.
-    Far OTM strikes are intentionally ignored as per RIGA rule.
-    """
-    cfg = INDEX_CONFIG[index]
-    master = _load_scrip_master()
-
-    today = now_ist().date()
-    wanted_strikes = {
-        float(atm + offset * cfg["step"])
-        for offset in range(-strikes_around, strikes_around + 1)
-    }
-
-    rows: List[Dict[str, Any]] = []
-    for item in master:
-        exch_seg = str(item.get("exch_seg", item.get("exchange", ""))).upper()
-        symbol = str(item.get("symbol", item.get("tradingsymbol", ""))).upper()
-        name = str(item.get("name", "")).upper()
-        instrumenttype = str(item.get("instrumenttype", "")).upper()
-
-        if exch_seg != cfg["option_exchange"]:
-            continue
-
-        if not any(k.replace(" ", "") in symbol.replace(" ", "") or k in name for k in cfg["name_keywords"]):
-            continue
-
-        if "OPT" not in instrumenttype and not (symbol.endswith("CE") or symbol.endswith("PE")):
-            continue
-
-        strike = _normalize_strike(item.get("strike"))
-        if strike is None:
-            continue
-
-        if strike not in wanted_strikes:
-            continue
-
-        opt_type = "CE" if symbol.endswith("CE") else "PE" if symbol.endswith("PE") else None
-        if opt_type not in ["CE", "PE"]:
-            continue
-
-        expiry_dt = _parse_expiry(item.get("expiry"))
-        if expiry_dt is None or expiry_dt.date() < today:
-            continue
-
-        rows.append(
-            {
-                "symbol": symbol,
-                "token": str(item.get("token", item.get("symboltoken", ""))),
-                "strike": strike,
-                "type": opt_type,
-                "expiry_dt": expiry_dt,
-                "expiry": expiry_dt.strftime("%d%b%Y").upper(),
-                "exchange": exch_seg,
-            }
-        )
-
-    if not rows:
-        raise RuntimeError(f"No ATM/near-ATM option contracts found for {index} ATM {atm}")
-
-    nearest_expiry = min(r["expiry_dt"] for r in rows)
-    rows = [r for r in rows if r["expiry_dt"] == nearest_expiry]
-
-    rows.sort(key=lambda r: (abs(r["strike"] - atm), 0 if r["type"] == "CE" else 1))
-    return rows
-
-
-def _index_spot_from_quote(index: str, jwt_token: str) -> Optional[float]:
-    """
-    Tries Angel quote API for index spot.
-    If quote API fails, caller can fallback to last candle close.
-    """
-    cfg = INDEX_CONFIG[index]
-    payload = {
-        "mode": "LTP",
-        "exchangeTokens": {
-            cfg["spot_exchange"]: [str(cfg["spot_token"])]
-        },
+    params = {
+        "exchange": exchange,
+        "symboltoken": str(symboltoken),
+        "interval": interval,
+        "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+        "todate": end.strftime("%Y-%m-%d %H:%M"),
     }
 
     try:
-        response = requests.post(
-            ANGEL_QUOTE_URL,
-            headers=_angel_headers(jwt_token),
-            json=payload,
-            timeout=15,
-        )
-        response.raise_for_status()
-        body = response.json()
-        data = body.get("data", {})
-        fetched = data.get("fetched") or []
-        if fetched:
-            ltp = fetched[0].get("ltp")
-            if ltp is not None:
-                return float(ltp)
-    except Exception:
-        return None
+        res = client.getCandleData(params)
+    except Exception as e:
+        return {"params": params, "error": str(e), "count": 0, "sample": []}
 
+    data = res.get("data", []) if isinstance(res, dict) else []
+    return {
+        "params": params,
+        "status": res.get("status") if isinstance(res, dict) else None,
+        "message": res.get("message") if isinstance(res, dict) else None,
+        "count": len(data or []),
+        "sample": data[-3:] if data else [],
+    }
+
+
+# -----------------------------
+# Technical Helpers
+# -----------------------------
+
+def safe_num(value):
+    return isinstance(value, (int, float)) and value is not None
+
+
+def round_to_step(price, step):
+    return int(round(price / step) * step)
+
+
+def parse_expiry(expiry):
+    for fmt in ("%d%b%Y", "%d%b%y", "%d-%b-%Y", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(str(expiry).upper(), fmt)
+        except Exception:
+            pass
     return None
 
 
-def fetch_market_data(index: str, token: str, strikes_around: int = 2) -> ScanPayload:
-    """
-    LIVE DATA CONNECTED:
-    Uses Angel One SmartAPI to fetch:
-    - live index candles
-    - live ATM/near-ATM CE/PE option premium candles
+def avg(values: List[float]) -> float:
+    vals = [v for v in values if safe_num(v)]
+    return sum(vals) / len(vals) if vals else 0.0
 
-    Requirements:
-    Environment variables:
-    - ANGEL_API_KEY
-    Optional:
-    - ANGEL_CLIENT_CODE
-    - ANGEL_JWT_TOKEN
 
-    Usage:
-    /scan-live/NIFTY?token=<RIGA_ACTION_TOKEN>&strikes_around=2
+def pct_change(a: float, b: float) -> float:
+    if not b:
+        return 0.0
+    return ((a - b) / b) * 100
 
-    Notes:
-    - This does NOT use far OTM options.
-    - This returns raw candles, so RIGA book filter can check breakout, retest, traps, candle quality, SL, and RR.
-    """
-    index = index.upper().strip()
-    if index not in INDEX_CONFIG:
-        raise RuntimeError(f"Unsupported index: {index}. Use NIFTY, BANKNIFTY, FINNIFTY, or SENSEX.")
 
-    jwt_token = _resolve_jwt_token(token)
-    cfg = INDEX_CONFIG[index]
+def candle_body(c):
+    return abs(c["close"] - c["open"])
 
-    interval = os.getenv("RIGA_CANDLE_INTERVAL", "ONE_MINUTE")
-    lookback_minutes = int(os.getenv("RIGA_LOOKBACK_MINUTES", "90"))
 
-    spot_ltp = _index_spot_from_quote(index, jwt_token)
+def candle_range(c):
+    return max(c["high"] - c["low"], 0.01)
 
-    try:
-        index_candles = _fetch_candles_with_fallbacks(
-            exchange=cfg["spot_exchange"],
-            token=cfg["spot_token"],
-            jwt_token=jwt_token,
-            interval=interval,
-            lookback_minutes=lookback_minutes,
-        )
-    except Exception:
-        index_candles = []
 
-    if spot_ltp is None and index_candles:
-        spot_ltp = index_candles[-1]["close"]
+def candle_strength(c):
+    return candle_body(c) / candle_range(c)
 
-    if spot_ltp is None:
-        raise RuntimeError(f"Spot quote and index candles unavailable for {index}")
 
-    if len(index_candles) < MIN_CANDLES:
-        # Do not crash the scanner. Use neutral pseudo candles and let RIGA return NO TRADE.
-        index_candles = _pseudo_index_candles_from_spot(float(spot_ltp), count=MIN_CANDLES)
+def candle_position(c):
+    return (c["close"] - c["low"]) / candle_range(c)
 
-    atm = _round_to_step(float(spot_ltp), int(cfg["step"]))
-    candidates = _find_option_candidates(index=index, atm=atm, strikes_around=strikes_around)
 
-    options: List[OptionCandidate] = []
-    for c in candidates:
+def upper_wick(c):
+    return c["high"] - max(c["open"], c["close"])
+
+
+def lower_wick(c):
+    return min(c["open"], c["close"]) - c["low"]
+
+
+def is_bull_candle(c):
+    return c["close"] > c["open"]
+
+
+def is_bear_candle(c):
+    return c["close"] < c["open"]
+
+
+def calc_vwap(candles: List[Dict[str, Any]]):
+    total_pv = 0.0
+    total_v = 0.0
+
+    for c in candles:
+        tp = (c["high"] + c["low"] + c["close"]) / 3
+        v = c.get("volume", 0) or 0
+        total_pv += tp * v
+        total_v += v
+
+    if total_v <= 0:
+        return None
+
+    return total_pv / total_v
+
+
+def find_swing_levels(candles: List[Dict[str, Any]], lookback: int = 20):
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+
+    if not recent:
+        return None
+
+    prev = recent[:-1] if len(recent) > 1 else recent
+
+    return {
+        "swing_high": max(c["high"] for c in recent),
+        "swing_low": min(c["low"] for c in recent),
+        "prev_high": max(c["high"] for c in prev),
+        "prev_low": min(c["low"] for c in prev),
+    }
+
+
+def volume_spike(candles: List[Dict[str, Any]], lookback: int = 20):
+    if len(candles) < 5:
+        return False, 0.0
+
+    last_v = candles[-1].get("volume", 0) or 0
+    prev_vols = [c.get("volume", 0) or 0 for c in candles[-lookback - 1:-1]]
+    base = avg(prev_vols)
+
+    if base <= 0:
+        return False, 0.0
+
+    ratio = last_v / base
+    return ratio >= 1.25, round(ratio, 2)
+
+
+def classify_candle(c):
+    strength = candle_strength(c)
+    pos = candle_position(c)
+
+    if strength >= 0.70 and pos >= 0.75 and is_bull_candle(c):
+        return "A_PLUS_BULL"
+    if strength >= 0.60 and pos >= 0.65 and is_bull_candle(c):
+        return "A_BULL"
+    if strength >= 0.45 and pos >= 0.60 and is_bull_candle(c):
+        return "B_BULL"
+
+    if strength >= 0.70 and pos <= 0.25 and is_bear_candle(c):
+        return "A_PLUS_BEAR"
+    if strength >= 0.60 and pos <= 0.35 and is_bear_candle(c):
+        return "A_BEAR"
+    if strength >= 0.45 and pos <= 0.40 and is_bear_candle(c):
+        return "B_BEAR"
+
+    return "LOW_QUALITY"
+
+
+def trap_filter(c):
+    body = max(candle_body(c), 0.01)
+    uw = upper_wick(c)
+    lw = lower_wick(c)
+    pos = candle_position(c)
+
+    if candle_strength(c) < 0.35:
+        return True, "weak body / indecision"
+
+    if uw > body * 1.8 and pos < 0.75:
+        return True, "upper wick rejection / fake breakout risk"
+
+    if lw > body * 1.8 and pos > 0.25:
+        return True, "lower wick rejection / fake breakdown risk"
+
+    return False, "no liquidity trap"
+
+
+# -----------------------------
+# Option Chain
+# -----------------------------
+
+def get_auto_option_chain(index_name, spot_price, strikes_around=3):
+    index_name = index_name.upper()
+
+    if index_name not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Use NIFTY, BANKNIFTY, FINNIFTY, SENSEX")
+
+    cfg = INDEX_CONFIG[index_name]
+    master = load_scrip_master()
+
+    atm = round_to_step(spot_price, cfg["step"])
+    allowed = {atm + i * cfg["step"] for i in range(-strikes_around, strikes_around + 1)}
+
+    today = now_ist().date()
+    found = []
+
+    for s in master:
         try:
-            option_candles = _fetch_candles_with_fallbacks(
-                exchange=c["exchange"],
-                token=c["token"],
-                jwt_token=jwt_token,
-                interval=interval,
-                lookback_minutes=lookback_minutes,
-            )
-        except Exception:
-            option_candles = []
+            if s.get("name") != cfg["option_name"]:
+                continue
+            if s.get("exch_seg") != cfg["option_exchange"]:
+                continue
+            if s.get("instrumenttype") != "OPTIDX":
+                continue
 
-        if len(option_candles) < MIN_CANDLES:
+            symbol = s.get("symbol", "")
+            if not (symbol.endswith("CE") or symbol.endswith("PE")):
+                continue
+
+            strike = int(float(s.get("strike", 0)) / 100)
+            if strike not in allowed:
+                continue
+
+            expiry_dt = parse_expiry(s.get("expiry"))
+            if not expiry_dt or expiry_dt.date() < today:
+                continue
+
+            found.append({
+                "exchange": cfg["option_exchange"],
+                "tradingsymbol": symbol,
+                "symboltoken": str(s.get("token")),
+                "strike": strike,
+                "type": "CE" if symbol.endswith("CE") else "PE",
+                "expiry": s.get("expiry"),
+                "expiry_dt": expiry_dt,
+            })
+
+        except Exception:
             continue
 
-        options.append(
-            OptionCandidate(
-                symbol=c["symbol"],
-                strike=c["strike"],
-                type=c["type"],
-                expiry=c["expiry"],
-                candles=[Candle(**x) for x in option_candles],
-                ltp=option_candles[-1]["close"],
-            )
+    if not found:
+        return atm, None, []
+
+    nearest = min(x["expiry_dt"] for x in found)
+    options = [x for x in found if x["expiry_dt"] == nearest]
+
+    for x in options:
+        x.pop("expiry_dt", None)
+
+    options.sort(key=lambda x: (abs(x["strike"] - atm), x["strike"], x["type"]))
+    return atm, nearest.strftime("%d%b%Y").upper(), options
+
+
+# -----------------------------
+# RIGA Logic
+# -----------------------------
+
+def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles: List[Dict[str, Any]]):
+    if not candles or len(candles) < MIN_CANDLES:
+        ltp = spot_data.get("ltp")
+        close = spot_data.get("close")
+
+        if safe_num(ltp) and safe_num(close):
+            chg = pct_change(ltp, close)
+
+            if chg >= 0.12:
+                return {
+                    "bias": "BULLISH",
+                    "option_side": "CE",
+                    "score": 55,
+                    "candle_count": len(candles or []),
+                    "reason": f"fallback bullish vs close {round(chg, 2)}%"
+                }
+
+            if chg <= -0.12:
+                return {
+                    "bias": "BEARISH",
+                    "option_side": "PE",
+                    "score": 55,
+                    "candle_count": len(candles or []),
+                    "reason": f"fallback bearish vs close {round(chg, 2)}%"
+                }
+
+        return {
+            "bias": "NEUTRAL",
+            "option_side": None,
+            "score": 0,
+            "candle_count": len(candles or []),
+            "reason": "not enough index candle data"
+        }
+
+    last = candles[-1]
+    levels = find_swing_levels(candles, 20)
+    vwap = calc_vwap(candles)
+    vol_ok, vol_ratio = volume_spike(candles)
+
+    last_close = last["close"]
+    prev_close = candles[-2]["close"]
+    first_open = candles[0]["open"]
+
+    score_bull = 0
+    score_bear = 0
+    bull = []
+    bear = []
+
+    intraday_change = pct_change(last_close, first_open)
+    last_momentum = pct_change(last_close, prev_close)
+
+    if intraday_change > 0.12:
+        score_bull += 20
+        bull.append(f"index intraday bullish {round(intraday_change, 2)}%")
+
+    if intraday_change < -0.12:
+        score_bear += 20
+        bear.append(f"index intraday bearish {round(intraday_change, 2)}%")
+
+    if vwap:
+        if last_close > vwap:
+            score_bull += 15
+            bull.append("index above VWAP")
+        elif last_close < vwap:
+            score_bear += 15
+            bear.append("index below VWAP")
+
+    if levels and last_close > levels["prev_high"]:
+        score_bull += 25
+        bull.append("index breakout above swing high")
+
+    if levels and last_close < levels["prev_low"]:
+        score_bear += 25
+        bear.append("index breakdown below swing low")
+
+    cq = classify_candle(last)
+
+    if cq in ["A_PLUS_BULL", "A_BULL"]:
+        score_bull += 15
+        bull.append(f"index {cq}")
+
+    if cq in ["A_PLUS_BEAR", "A_BEAR"]:
+        score_bear += 15
+        bear.append(f"index {cq}")
+
+    if last_momentum > 0.03:
+        score_bull += 10
+        bull.append("last candle bullish momentum")
+
+    if last_momentum < -0.03:
+        score_bear += 10
+        bear.append("last candle bearish momentum")
+
+    if vol_ok:
+        score_bull += 5
+        score_bear += 5
+        bull.append(f"volume spike {vol_ratio}x")
+        bear.append(f"volume spike {vol_ratio}x")
+
+    trap, trap_reason = trap_filter(last)
+    if trap:
+        score_bull -= 20
+        score_bear -= 20
+
+    base = {
+        "vwap": round(vwap, 2) if vwap else None,
+        "candle_count": len(candles),
+        "last_candle": last,
+        "trap": trap_reason if trap else "no trap",
+    }
+
+    if score_bull >= 55 and score_bull > score_bear:
+        return {
+            **base,
+            "bias": "BULLISH",
+            "option_side": "CE",
+            "score": min(score_bull, 95),
+            "reason": ", ".join(bull)
+        }
+
+    if score_bear >= 55 and score_bear > score_bull:
+        return {
+            **base,
+            "bias": "BEARISH",
+            "option_side": "PE",
+            "score": min(score_bear, 95),
+            "reason": ", ".join(bear)
+        }
+
+    return {
+        **base,
+        "bias": "NEUTRAL",
+        "option_side": None,
+        "score": max(score_bull, score_bear),
+        "reason": "index structure not clean enough"
+    }
+
+
+def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name):
+    side = index_bias.get("option_side")
+
+    if side not in ["CE", "PE"]:
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "index neutral"}
+
+    if opt.get("type") != side:
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "option side not aligned"}
+
+    if not ltp_data or not safe_num(ltp_data.get("ltp")):
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "no option LTP"}
+
+    if not candles or len(candles) < MIN_CANDLES:
+        return {
+            "bias": "NO TRADE",
+            "confidence": 0,
+            "reason": "not enough option candle data",
+            "candle_count": len(candles or [])
+        }
+
+    last = candles[-1]
+    levels = find_swing_levels(candles, 20)
+    vwap = calc_vwap(candles)
+    vol_ok, vol_ratio = volume_spike(candles)
+
+    entry = float(ltp_data["ltp"])
+    score = 0
+    reasons = []
+
+    idx_score = index_bias.get("score", 0)
+
+    if idx_score >= 70:
+        score += 20
+    elif idx_score >= 55:
+        score += 12
+
+    reasons.append(index_bias.get("reason", ""))
+
+    if not levels:
+        return {"bias": "NO TRADE", "confidence": score, "reason": "no swing levels"}
+
+    if last["close"] > levels["prev_high"]:
+        score += 25
+        reasons.append("premium breakout above swing high")
+        pattern = "PREMIUM_BREAKOUT"
+    elif vwap and last["close"] > vwap and last["close"] > candles[-2]["close"]:
+        score += 10
+        reasons.append("premium continuation above VWAP")
+        pattern = "PREMIUM_CONTINUATION"
+    else:
+        return {
+            "bias": "NO TRADE",
+            "confidence": score,
+            "reason": "premium breakout not activated",
+            "candle_count": len(candles)
+        }
+
+    cq = classify_candle(last)
+    strength = candle_strength(last)
+    mom = pct_change(last["close"], candles[-2]["close"])
+
+    # Late breakout / exhaustion filter from book logic
+    if strength >= 0.92 and mom >= 3.0:
+        return {
+            "bias": "NO TRADE",
+            "confidence": score,
+            "pattern": pattern,
+            "candle": cq,
+            "candle_strength": round(strength, 2),
+            "momentum_pct": round(mom, 2),
+            "reason": "exhaustion breakout / late entry rejected"
+        }
+
+    if vwap:
+        distance_from_vwap = pct_change(entry, vwap)
+        if distance_from_vwap > 8.0:
+            return {
+                "bias": "NO TRADE",
+                "confidence": score,
+                "pattern": pattern,
+                "premium_vwap": round(vwap, 2),
+                "distance_from_vwap_pct": round(distance_from_vwap, 2),
+                "reason": "premium too extended from VWAP / chase rejected"
+            }
+
+    if cq == "A_PLUS_BULL":
+        score += 20
+        reasons.append("A+ bullish premium candle")
+    elif cq == "A_BULL":
+        score += 15
+        reasons.append("A grade bullish premium candle")
+    else:
+        return {
+            "bias": "NO TRADE",
+            "confidence": score,
+            "pattern": pattern,
+            "candle": cq,
+            "reason": "premium candle quality not strong"
+        }
+
+    if mom > 0.25:
+        score += 15
+        reasons.append(f"strong premium momentum {round(mom, 2)}%")
+    elif mom > 0.08:
+        score += 8
+        reasons.append(f"premium momentum {round(mom, 2)}%")
+
+    if vwap and last["close"] > vwap:
+        score += 10
+        reasons.append("premium above VWAP")
+
+    if vol_ok:
+        score += 10
+        reasons.append(f"volume expansion {vol_ratio}x")
+
+    trap, trap_reason = trap_filter(last)
+    if trap:
+        return {
+            "bias": "NO TRADE",
+            "confidence": max(score - 25, 0),
+            "pattern": pattern,
+            "candle": cq,
+            "trap_filter": trap_reason,
+            "reason": f"trap rejected: {trap_reason}"
+        }
+
+    step = INDEX_CONFIG[index_name]["step"]
+    atm_distance = abs(opt["strike"] - atm)
+
+    if atm_distance == 0:
+        score += 10
+        reasons.append("ATM strike")
+    elif atm_distance <= step:
+        score += 7
+        reasons.append("near ATM strike")
+    elif atm_distance <= step * 2:
+        score += 2
+        reasons.append("acceptable strike distance")
+    else:
+        score -= 15
+        reasons.append("far from ATM penalty")
+
+    buffer = max(entry * DEFAULT_BUFFER_PCT, 2.0)
+    structure_sl = min(levels["swing_low"], levels["prev_low"]) - buffer
+    risk = round(entry - structure_sl, 2)
+    risk_pct = (risk / entry) * 100 if entry else 999
+
+    if structure_sl <= 0 or structure_sl >= entry:
+        return {"bias": "NO TRADE", "confidence": score, "reason": "invalid structure SL"}
+
+    if risk_pct > MAX_RISK_PCT:
+        return {
+            "bias": "NO TRADE",
+            "confidence": score,
+            "entry": round(entry, 2),
+            "sl": round(structure_sl, 2),
+            "risk_pct": round(risk_pct, 2),
+            "reason": f"risk too wide >{MAX_RISK_PCT}%"
+        }
+
+    if risk_pct < MIN_RISK_PCT:
+        return {
+            "bias": "NO TRADE",
+            "confidence": score,
+            "entry": round(entry, 2),
+            "sl": round(structure_sl, 2),
+            "risk_pct": round(risk_pct, 2),
+            "reason": "risk too tight / noise SL"
+        }
+
+    t1 = round(entry + risk * 1.5, 2)
+    t2 = round(entry + risk * 2.0, 2)
+    t3 = round(entry + risk * 3.0, 2)
+
+    if not (structure_sl < entry < t1 < t2 < t3):
+        return {"bias": "NO TRADE", "confidence": score, "reason": "RR structure invalid"}
+
+    confidence = min(score, 95)
+
+    if confidence < CONFIDENCE_MIN:
+        return {
+            "bias": "NO TRADE",
+            "confidence": confidence,
+            "pattern": pattern,
+            "candle": cq,
+            "reason": f"RIGA sniper score below {CONFIDENCE_MIN}"
+        }
+
+    return {
+        "bias": "BUY_CE" if side == "CE" else "BUY_PE",
+        "entry": round(entry, 2),
+        "sl": round(structure_sl, 2),
+        "target": t2,
+        "targets": {"t1": t1, "t2": t2, "t3": t3},
+        "risk": risk,
+        "risk_pct": round(risk_pct, 2),
+        "confidence": confidence,
+        "pattern": pattern,
+        "candle": cq,
+        "candle_strength": round(strength, 2),
+        "momentum_pct": round(mom, 2),
+        "premium_vwap": round(vwap, 2) if vwap else None,
+        "volume_spike": vol_ratio if vol_ok else None,
+        "atm_distance": atm_distance,
+        "trap_filter": trap_reason,
+        "candle_count": len(candles),
+        "reason": ", ".join([r for r in reasons if r]),
+    }
+
+
+def select_best_trade(trades):
+    if not trades:
+        return None
+
+    def score_key(t):
+        sig = t["signal"]
+        return (
+            sig.get("confidence", 0),
+            -sig.get("atm_distance", 9999),
+            -sig.get("risk_pct", 99),
         )
 
-    if not options:
-        raise RuntimeError(f"No option premium candles available for {index}")
+    return sorted(trades, key=score_key, reverse=True)[0]
 
-    return ScanPayload(
+
+# -----------------------------
+# Core scan functions
+# -----------------------------
+
+def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MINUTE", debug: bool = False):
+    index = index.upper()
+
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
+
+    client = get_client()
+    cfg = INDEX_CONFIG[index]
+    spot_item = cfg["spot"]
+
+    spot_data = get_ltp(client, spot_item)
+    if not spot_data:
+        raise HTTPException(status_code=500, detail="Spot data failed")
+
+    hist_token = spot_item.get("hist_token", spot_item["symboltoken"])
+    index_candles = get_candles(client, spot_item["exchange"], hist_token, interval=interval)
+
+    index_bias = analyze_index_structure(index, spot_data, index_candles)
+    index_bias["index"] = index
+
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
+
+    side = index_bias.get("option_side")
+    if side not in ["CE", "PE"]:
+        return {
+            "index": index,
+            "spot_ltp": spot_data["ltp"],
+            "spot_close": spot_data.get("close"),
+            "index_bias": index_bias,
+            "atm": atm,
+            "nearest_expiry": expiry,
+            "total_options_scanned": 0,
+            "trade_count": 0,
+            "best_trade": "NO TRADE",
+        }
+
+    options = [opt for opt in options if opt["type"] == side]
+
+    trades = []
+    rejected = []
+    scanned = 0
+
+    for opt in options:
+        ltp_data = get_ltp(client, opt)
+        opt_candles = get_candles(client, opt["exchange"], opt["symboltoken"], interval=interval)
+
+        signal = analyze_option_buy_setup(index_bias, opt, ltp_data, opt_candles, atm, index)
+        scanned += 1
+
+        if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= CONFIDENCE_MIN:
+            trades.append({
+                "index": index,
+                "option": opt,
+                "data": ltp_data,
+                "signal": signal,
+                "atm_distance": signal.get("atm_distance", abs(opt["strike"] - atm)),
+            })
+        elif debug:
+            rejected.append({
+                "symbol": opt.get("tradingsymbol"),
+                "strike": opt.get("strike"),
+                "type": opt.get("type"),
+                "reason": signal.get("reason"),
+                "confidence": signal.get("confidence", 0),
+                "candle_count": signal.get("candle_count"),
+            })
+
+    best_trade = select_best_trade(trades)
+
+    out = {
+        "index": index,
+        "spot_ltp": spot_data["ltp"],
+        "spot_close": spot_data.get("close"),
+        "index_bias": index_bias,
+        "atm": atm,
+        "nearest_expiry": expiry,
+        "total_options_scanned": scanned,
+        "trade_count": len(trades),
+        "best_trade": best_trade if best_trade else "NO TRADE",
+    }
+
+    if debug:
+        out["rejected"] = rejected[:10]
+
+    return out
+
+
+# -----------------------------
+# API Routes
+# -----------------------------
+
+@app.get("/")
+def root():
+    return {
+        "name": "RIGA AI Option Buying Scanner",
+        "version": "10.0",
+        "status": "ok",
+        "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "server_time": now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        "routes": [
+            "/getSpotPrice",
+            "/getOptionChain",
+            "/scanOptions",
+            "/scanAllMarkets",
+            "/candles-test",
+        ],
+    }
+
+
+@app.get("/candles-test")
+def candles_test(
+    index: str = Query("NIFTY"),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    check_token(authorization, token)
+
+    index = index.upper()
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
+
+    client = get_client()
+    item = INDEX_CONFIG[index]["spot"]
+    hist_token = item.get("hist_token", item["symboltoken"])
+
+    return get_candles_debug(client, item["exchange"], hist_token, interval)
+
+
+@app.get("/getSpotPrice")
+def get_spot_price(
+    index: str = Query("NIFTY"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    check_token(authorization, token)
+
+    index = index.upper()
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
+
+    client = get_client()
+    return get_ltp(client, INDEX_CONFIG[index]["spot"])
+
+
+@app.get("/spot")
+def spot_alias(
+    index: str = Query("NIFTY"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    return get_spot_price(index=index, authorization=authorization, token=token)
+
+
+@app.get("/getOptionChain")
+def get_option_chain(
+    index: str = Query("NIFTY"),
+    strikes_around: int = Query(3),
+    include_premium: bool = Query(False),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    check_token(authorization, token)
+
+    index = index.upper()
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
+
+    client = get_client()
+    spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
+
+    if not spot_data:
+        raise HTTPException(status_code=500, detail="Spot data failed")
+
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
+
+    if include_premium:
+        for opt in options:
+            opt["premium"] = get_ltp(client, opt)
+
+    return {
+        "index": index,
+        "spot": spot_data,
+        "atm": atm,
+        "nearest_expiry": expiry,
+        "options_count": len(options),
+        "options": options,
+    }
+
+
+@app.get("/option-chain")
+def option_chain_alias(
+    index: str = Query("NIFTY"),
+    strikes_around: int = Query(3),
+    include_premium: bool = Query(False),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    return get_option_chain(
         index=index,
-        spot_ltp=float(spot_ltp),
-        atm=float(atm),
-        index_candles=[Candle(**x) for x in index_candles],
-        options=options,
         strikes_around=strikes_around,
+        include_premium=include_premium,
+        authorization=authorization,
+        token=token,
+    )
+
+
+@app.get("/scanOptions")
+def scan_options(
+    index: str = Query("NIFTY"),
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    debug: bool = Query(False),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    check_token(authorization, token)
+    return scan_one_index(index=index, strikes_around=strikes_around, interval=interval, debug=debug)
+
+
+@app.get("/scan-options")
+def scan_options_alias(
+    index: str = Query("NIFTY"),
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    debug: bool = Query(False),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    return scan_options(
+        index=index,
+        strikes_around=strikes_around,
+        interval=interval,
+        debug=debug,
+        authorization=authorization,
+        token=token,
+    )
+
+
+@app.get("/scanAllMarkets")
+def scan_all_markets(
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    check_token(authorization, token)
+
+    markets = {}
+    valid_trades = []
+
+    for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
+        try:
+            res = scan_one_index(
+                index=idx,
+                strikes_around=strikes_around,
+                interval=interval,
+                debug=False,
+            )
+
+            best = res.get("best_trade")
+            if isinstance(best, dict) and best.get("signal", {}).get("bias") in ["BUY_CE", "BUY_PE"]:
+                valid_trades.append(best)
+
+            # Compact output only to avoid ResponseTooLargeError
+            markets[idx] = {
+                "spot_ltp": res.get("spot_ltp"),
+                "index_bias": res.get("index_bias"),
+                "atm": res.get("atm"),
+                "trade_count": res.get("trade_count"),
+                "best_trade": best,
+            }
+
+        except Exception as exc:
+            markets[idx] = {
+                "spot_ltp": None,
+                "index_bias": {"bias": "ERROR", "reason": str(exc)},
+                "atm": None,
+                "trade_count": 0,
+                "best_trade": "NO TRADE",
+            }
+
+    overall_best = select_best_trade(valid_trades)
+
+    return {
+        "overall_best_trade": overall_best if overall_best else "NO TRADE",
+        "markets": markets,
+    }
+
+
+@app.get("/scan-all-options")
+def scan_all_options_alias(
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    return scan_all_markets(
+        strikes_around=strikes_around,
+        interval=interval,
+        authorization=authorization,
+        token=token,
+    )
+
+
+@app.get("/scan_all_markets")
+def scan_all_markets_snake_alias(
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    return scan_all_markets(
+        strikes_around=strikes_around,
+        interval=interval,
+        authorization=authorization,
+        token=token,
     )
 
 
 # -----------------------------
-# FastAPI app
+# Formatter
 # -----------------------------
 
-if FastAPI is not None:
-    app = FastAPI(title="RIGA AI Option Buying Scanner", version="2.0")
-
-    @app.get("/")
-    def root() -> Dict[str, str]:
-        return {
-            "name": "RIGA AI Option Buying Scanner",
-            "status": "ok",
-            "rule": "Bullish -> BUY CE, Bearish -> BUY PE, otherwise NO TRADE",
-        }
-
-    @app.post("/scan")
-    def scan(payload: ScanPayload) -> Dict[str, Any]:
-        try:
-            return scan_payload(payload)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @app.post("/scan-live/{index}")
-    def scan_live(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        try:
-            payload = fetch_market_data(index=index, token=token, strikes_around=strikes_around)
-            return scan_payload(payload)
-        except NotImplementedError as exc:
-            raise HTTPException(status_code=501, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @app.get("/health")
-    def health() -> Dict[str, Any]:
-        return {
-            "status": "ok",
-            "server_time": now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
-            "routes": [
-                "/scan-live/{index}",
-                "/scanOptions",
-                "/getOptionChain",
-                "/scanAllMarkets",
-                "/getSpotPrice",
-            ],
-        }
-
-    @app.get("/scan-live/{index}")
-    def scan_live_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        try:
-            payload = fetch_market_data(index=index, token=token, strikes_around=strikes_around)
-            return scan_payload(payload)
-        except NotImplementedError as exc:
-            raise HTTPException(status_code=501, detail=str(exc))
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @app.post("/getSpotPrice")
-    def get_spot_price(index: str, token: str) -> Dict[str, Any]:
-        try:
-            index = index.upper().strip()
-            if index not in INDEX_CONFIG:
-                raise RuntimeError(f"Unsupported index: {index}")
-            jwt_token = _resolve_jwt_token(token)
-            spot = _index_spot_from_quote(index, jwt_token)
-            if spot is None:
-                cfg = INDEX_CONFIG[index]
-                candles = _fetch_candles(
-                    exchange=cfg["spot_exchange"],
-                    token=cfg["spot_token"],
-                    jwt_token=jwt_token,
-                    interval=os.getenv("RIGA_CANDLE_INTERVAL", "ONE_MINUTE"),
-                    lookback_minutes=20,
-                )
-                if not candles:
-                    raise RuntimeError("No candles available for fallback spot")
-                spot = candles[-1]["close"]
-            return {"index": index, "spot_ltp": float(spot)}
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @app.get("/getSpotPrice")
-    def get_spot_price_get(index: str, token: str) -> Dict[str, Any]:
-        return get_spot_price(index=index, token=token)
-
-    @app.post("/getOptionChain")
-    def get_option_chain(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
-        try:
-            index = index.upper().strip()
-            if index not in INDEX_CONFIG:
-                raise RuntimeError(f"Unsupported index: {index}")
-            jwt_token = _resolve_jwt_token(token)
-            spot = _index_spot_from_quote(index, jwt_token)
-            if spot is None:
-                cfg = INDEX_CONFIG[index]
-                candles = _fetch_candles(
-                    exchange=cfg["spot_exchange"],
-                    token=cfg["spot_token"],
-                    jwt_token=jwt_token,
-                    interval=os.getenv("RIGA_CANDLE_INTERVAL", "ONE_MINUTE"),
-                    lookback_minutes=20,
-                )
-                if not candles:
-                    raise RuntimeError("No candles available for fallback spot")
-                spot = candles[-1]["close"]
-
-            atm = _round_to_step(float(spot), int(INDEX_CONFIG[index]["step"]))
-            candidates = _find_option_candidates(index=index, atm=atm, strikes_around=strikes_around)
-            options = [
-                {
-                    "exchange": c["exchange"],
-                    "tradingsymbol": c["symbol"],
-                    "symboltoken": c["token"],
-                    "strike": c["strike"],
-                    "type": c["type"],
-                    "expiry": c["expiry"],
-                }
-                for c in candidates
-            ]
-            return {
-                "index": index,
-                "spot": {"ltp": float(spot)},
-                "atm": float(atm),
-                "nearest_expiry": options[0]["expiry"] if options else None,
-                "options_count": len(options),
-                "options": options,
-            }
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @app.get("/getOptionChain")
-    def get_option_chain_get(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
-        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/scanOptions")
-    def scan_options(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        try:
-            payload = fetch_market_data(index=index, token=token, strikes_around=strikes_around)
-            result = scan_payload(payload)
-            best = result.get("best_trade")
-            return {
-                "index": result.get("index"),
-                "spot_ltp": result.get("spot_ltp"),
-                "atm": result.get("atm"),
-                "index_bias": result.get("index_bias"),
-                "trade_count": result.get("trade_count", 0),
-                "best_trade": best,
-                "trades": [
-                    s for s in result.get("signals", [])
-                    if s.get("decision") in ["BUY_CE", "BUY_PE"]
-                ],
-                "all_signals": result.get("signals", []),
-                "formatted": format_riga_output(result),
-            }
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-
-    @app.get("/scanOptions")
-    def scan_options_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/scanAllMarkets")
-    def scan_all_markets(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        results: Dict[str, Any] = {}
-        valid_trades: List[Dict[str, Any]] = []
-
-        for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
-            try:
-                res = scan_options(index=idx, token=token, strikes_around=strikes_around)
-                results[idx] = res
-                best = res.get("best_trade")
-                if isinstance(best, dict) and best.get("decision") in ["BUY_CE", "BUY_PE"]:
-                    valid_trades.append(best)
-            except Exception as exc:
-                results[idx] = {"index": idx, "best_trade": "NO TRADE", "error": str(exc)}
-
-        if not valid_trades:
-            return {
-                "best_trade": "NO TRADE",
-                "trade_count": 0,
-                "results": results,
-            }
-
-        best = sorted(
-            valid_trades,
-            key=lambda x: (x.get("confidence", 0), -x.get("risk_pct", 999)),
-            reverse=True,
-        )[0]
-
-        return {
-            "best_trade": best,
-            "trade_count": len(valid_trades),
-            "results": results,
-        }
-
-    @app.get("/scanAllMarkets")
-    def scan_all_markets_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    # Extra compatibility aliases for action/plugin path naming
-    @app.post("/scan-options")
-    def scan_options_dash(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.get("/scan-options")
-    def scan_options_dash_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/scan_options")
-    def scan_options_snake(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.get("/scan_options")
-    def scan_options_snake_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/scan/options")
-    def scan_options_slash(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.get("/scan/options")
-    def scan_options_slash_get(index: str, token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_options(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/scan-all-markets")
-    def scan_all_markets_dash(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.get("/scan-all-markets")
-    def scan_all_markets_dash_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.post("/scan_all_markets")
-    def scan_all_markets_snake(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.get("/scan_all_markets")
-    def scan_all_markets_snake_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.post("/scanallmarkets")
-    def scan_all_markets_lower(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.get("/scanallmarkets")
-    def scan_all_markets_lower_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.post("/scan-all")
-    def scan_all_short(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.get("/scan-all")
-    def scan_all_short_get(token: str, strikes_around: int = 2) -> Dict[str, Any]:
-        return scan_all_markets(token=token, strikes_around=strikes_around)
-
-    @app.post("/option-chain")
-    def get_option_chain_dash(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
-        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
-
-    @app.get("/option-chain")
-    def get_option_chain_dash_get(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
-        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/option_chain")
-    def get_option_chain_snake(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
-        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
-
-    @app.get("/option_chain")
-    def get_option_chain_snake_get(index: str, token: str, strikes_around: int = 3) -> Dict[str, Any]:
-        return get_option_chain(index=index, token=token, strikes_around=strikes_around)
-
-    @app.post("/spot-price")
-    def get_spot_price_dash(index: str, token: str) -> Dict[str, Any]:
-        return get_spot_price(index=index, token=token)
-
-    @app.get("/spot-price")
-    def get_spot_price_dash_get(index: str, token: str) -> Dict[str, Any]:
-        return get_spot_price(index=index, token=token)
-
-    @app.post("/spot_price")
-    def get_spot_price_snake(index: str, token: str) -> Dict[str, Any]:
-        return get_spot_price(index=index, token=token)
-
-    @app.get("/spot_price")
-    def get_spot_price_snake_get(index: str, token: str) -> Dict[str, Any]:
-        return get_spot_price(index=index, token=token)
-
-
-# -----------------------------
-# Final output formatter
-# -----------------------------
-
-def format_riga_output(scan_result: Dict[str, Any]) -> str:
-    best = scan_result.get("best_trade")
-    if best == "NO TRADE" or not isinstance(best, dict):
+def format_riga_output(trade: Any) -> str:
+    if trade == "NO TRADE" or not isinstance(trade, dict):
         return "NO TRADE"
 
-    bias = "Bullish" if best["index_bias"] == "BULLISH" else "Bearish"
-    option_trade = "BUY CE" if best["decision"] == "BUY_CE" else "BUY PE"
+    sig = trade.get("signal", {})
+    bias = sig.get("bias")
+
+    if bias not in ["BUY_CE", "BUY_PE"]:
+        return "NO TRADE"
+
+    market_bias = "Bullish" if bias == "BUY_CE" else "Bearish"
+    option_trade = "BUY CE" if bias == "BUY_CE" else "BUY PE"
 
     return (
         f"Market:\n"
-        f"Bias: {bias}\n"
+        f"Bias: {market_bias}\n"
         f"Option Trade: {option_trade}\n"
-        f"Strike: {best.get('strike')}\n"
-        f"Entry: {best.get('entry')}\n"
-        f"Stop Loss: {best.get('stop_loss')}\n"
-        f"Target: {best.get('targets')}\n"
-        f"Confidence: {best.get('confidence')}%\n"
-        f"Reason: {best.get('reason')}"
+        f"Strike: {trade.get('option', {}).get('strike')}\n"
+        f"Entry: {sig.get('entry')}\n"
+        f"Stop Loss: {sig.get('sl')}\n"
+        f"Target: {sig.get('targets')}\n"
+        f"Confidence: {sig.get('confidence')}%\n"
+        f"Reason: {sig.get('reason')}"
     )
 
 
