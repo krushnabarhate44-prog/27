@@ -41,7 +41,7 @@ RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN", "")
 
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-CONFIDENCE_MIN = 85
+CONFIDENCE_MIN = 70
 MAX_RISK_PCT = 22.0
 MIN_RISK_PCT = 2.0
 DEFAULT_BUFFER_PCT = 0.015
@@ -349,6 +349,23 @@ def get_candles_debug(client, exchange: str, symboltoken: str, interval: str = "
         "count": len(data or []),
         "sample": data[-3:] if data else [],
     }
+
+
+def fetch_option_candles_debug(client, opt: Dict[str, Any], interval: str = "FIVE_MINUTE") -> Dict[str, Any]:
+    """
+    Debug helper for option premium candles.
+    Use this to verify whether Angel is returning candles for the exact option token.
+    """
+    dbg = get_candles_debug(
+        client,
+        opt.get("exchange", "NFO"),
+        str(opt.get("symboltoken")),
+        interval=interval,
+    )
+    dbg["symbol"] = opt.get("tradingsymbol")
+    dbg["strike"] = opt.get("strike")
+    dbg["type"] = opt.get("type")
+    return dbg
 
 
 # -----------------------------
@@ -989,6 +1006,17 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     fresh, freshness_reason = is_candle_data_fresh(index_candles)
     atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
 
+    total_options_found = len(options)
+    option_debug_summary = {
+        "total_options_found": total_options_found,
+        "side_options_found": 0,
+        "ltp_checked": 0,
+        "candle_requests": 0,
+        "options_with_candles": 0,
+        "options_without_candles": 0,
+        "options_with_insufficient_candles": 0,
+    }
+
     if not fresh:
         return {
             "index": index,
@@ -1005,6 +1033,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             },
             "atm": atm,
             "nearest_expiry": expiry,
+            **option_debug_summary,
             "total_options_scanned": 0,
             "trade_count": 0,
             "best_trade": "NO TRADE",
@@ -1022,23 +1051,51 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             "index_bias": index_bias,
             "atm": atm,
             "nearest_expiry": expiry,
+            **option_debug_summary,
             "total_options_scanned": 0,
             "trade_count": 0,
             "best_trade": "NO TRADE",
+            "reason": "index neutral, option scan skipped",
         }
 
-    options = [opt for opt in options if opt["type"] == side]
+    side_options = [opt for opt in options if opt["type"] == side]
+    option_debug_summary["side_options_found"] = len(side_options)
 
     trades = []
     rejected = []
     scanned = 0
 
-    for opt in options:
+    for opt in side_options:
+        symbol = opt.get("tradingsymbol")
+        symboltoken = opt.get("symboltoken")
+
+        if not symboltoken:
+            rejected.append({
+                "symbol": symbol,
+                "strike": opt.get("strike"),
+                "type": opt.get("type"),
+                "reason": "NO_SYMBOL_TOKEN",
+                "confidence": 0,
+                "candle_count": 0,
+            })
+            continue
+
+        option_debug_summary["ltp_checked"] += 1
         ltp_data = get_ltp(client, opt)
-        opt_candles = get_candles(client, opt["exchange"], opt["symboltoken"], interval=interval)
+
+        option_debug_summary["candle_requests"] += 1
+        opt_candles = get_candles(client, opt["exchange"], symboltoken, interval=interval)
+        candle_count = len(opt_candles or [])
+
+        if candle_count <= 0:
+            option_debug_summary["options_without_candles"] += 1
+        elif candle_count < MIN_CANDLES:
+            option_debug_summary["options_with_insufficient_candles"] += 1
+        else:
+            option_debug_summary["options_with_candles"] += 1
+            scanned += 1
 
         signal = analyze_option_buy_setup(index_bias, opt, ltp_data, opt_candles, atm, index)
-        scanned += 1
 
         if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= CONFIDENCE_MIN:
             trades.append({
@@ -1050,12 +1107,13 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             })
         elif debug:
             rejected.append({
-                "symbol": opt.get("tradingsymbol"),
+                "symbol": symbol,
                 "strike": opt.get("strike"),
                 "type": opt.get("type"),
+                "ltp": ltp_data.get("ltp") if isinstance(ltp_data, dict) else None,
                 "reason": signal.get("reason"),
                 "confidence": signal.get("confidence", 0),
-                "candle_count": signal.get("candle_count"),
+                "candle_count": signal.get("candle_count", candle_count),
             })
 
     best_trade = select_best_trade(trades)
@@ -1067,13 +1125,14 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         "index_bias": index_bias,
         "atm": atm,
         "nearest_expiry": expiry,
+        **option_debug_summary,
         "total_options_scanned": scanned,
         "trade_count": len(trades),
         "best_trade": best_trade if best_trade else "NO TRADE",
     }
 
     if debug:
-        out["rejected"] = rejected[:10]
+        out["rejected"] = rejected[:20]
 
     return out
 
@@ -1104,6 +1163,7 @@ def health():
             "/scanOptions",
             "/scanAllMarkets",
             "/candles-test",
+            "/option-candles-test",
         ],
     }
 
@@ -1126,6 +1186,64 @@ def candles_test(
     hist_token = item.get("hist_token", item["symboltoken"])
 
     return get_candles_debug(client, item["exchange"], hist_token, interval)
+
+
+
+@app.get("/option-candles-test")
+def option_candles_test(
+    index: str = Query("NIFTY"),
+    strike: Optional[int] = Query(None),
+    side: Side = Query("CE"),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    """
+    Example:
+    /option-candles-test?index=BANKNIFTY&strike=54400&side=PE&token=YOUR_TOKEN
+
+    This verifies if Angel is returning candles for that exact option token.
+    """
+    check_token(authorization, token)
+
+    index = index.upper()
+    if index not in INDEX_CONFIG:
+        raise HTTPException(status_code=400, detail="Invalid index")
+
+    client = get_client()
+    spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
+    if not spot_data:
+        raise HTTPException(status_code=500, detail="Spot data failed")
+
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around=6)
+    wanted_strike = strike or atm
+
+    match = None
+    for opt in options:
+        if opt.get("strike") == wanted_strike and opt.get("type") == side:
+            match = opt
+            break
+
+    if not match:
+        return {
+            "index": index,
+            "atm": atm,
+            "nearest_expiry": expiry,
+            "requested": {"strike": wanted_strike, "side": side},
+            "found": False,
+            "available": [
+                {
+                    "tradingsymbol": o.get("tradingsymbol"),
+                    "strike": o.get("strike"),
+                    "type": o.get("type"),
+                    "symboltoken": o.get("symboltoken"),
+                    "expiry": o.get("expiry"),
+                }
+                for o in options
+            ],
+        }
+
+    return fetch_option_candles_debug(client, match, interval=interval)
 
 
 @app.get("/getSpotPrice")
@@ -1242,6 +1360,7 @@ def scan_options_alias(
 def scan_all_markets(
     strikes_around: int = Query(3),
     interval: str = Query("FIVE_MINUTE"),
+    debug: bool = Query(False),
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
@@ -1256,7 +1375,7 @@ def scan_all_markets(
                 index=idx,
                 strikes_around=strikes_around,
                 interval=interval,
-                debug=False,
+                debug=debug,
             )
 
             best = res.get("best_trade")
@@ -1268,9 +1387,20 @@ def scan_all_markets(
                 "spot_ltp": res.get("spot_ltp"),
                 "index_bias": res.get("index_bias"),
                 "atm": res.get("atm"),
+                "nearest_expiry": res.get("nearest_expiry"),
+                "total_options_found": res.get("total_options_found"),
+                "side_options_found": res.get("side_options_found"),
+                "candle_requests": res.get("candle_requests"),
+                "options_with_candles": res.get("options_with_candles"),
+                "options_without_candles": res.get("options_without_candles"),
+                "options_with_insufficient_candles": res.get("options_with_insufficient_candles"),
+                "total_options_scanned": res.get("total_options_scanned"),
                 "trade_count": res.get("trade_count"),
                 "best_trade": best,
             }
+
+            if debug and res.get("rejected"):
+                markets[idx]["rejected"] = res.get("rejected")
 
         except Exception as exc:
             markets[idx] = {
@@ -1293,12 +1423,14 @@ def scan_all_markets(
 def scan_all_options_alias(
     strikes_around: int = Query(3),
     interval: str = Query("FIVE_MINUTE"),
+    debug: bool = Query(False),
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
     return scan_all_markets(
         strikes_around=strikes_around,
         interval=interval,
+        debug=debug,
         authorization=authorization,
         token=token,
     )
