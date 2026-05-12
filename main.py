@@ -47,6 +47,14 @@ MIN_RISK_PCT = 2.0
 DEFAULT_BUFFER_PCT = 0.015
 MIN_CANDLES = 8
 
+# Transition scan:
+# Do not skip option-premium scan only because the last index candle is weak/indecisive.
+# If the broader index score is near directional, scan ATM/near-ATM CE and PE and let
+# option premium structure decide. This improves opportunity capture without forcing trades.
+TRANSITION_SCAN_MIN_SCORE = 40
+TRANSITION_STRIKES_AROUND = 1
+MAX_SCAN_STRIKES_AROUND = 6
+
 client_obj = None
 scrip_master_cache = None
 
@@ -631,7 +639,11 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
                     "option_side": "CE",
                     "score": 55,
                     "candle_count": len(candles or []),
-                    "reason": f"fallback bullish vs close {round(chg, 2)}%"
+                    "reason": f"fallback bullish vs close {round(chg, 2)}%",
+                    "bull_score": 55,
+                    "bear_score": 0,
+                    "transition_scan": False,
+                    "transition_sides": ["CE"]
                 }
 
             if chg <= -0.12:
@@ -640,7 +652,11 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
                     "option_side": "PE",
                     "score": 55,
                     "candle_count": len(candles or []),
-                    "reason": f"fallback bearish vs close {round(chg, 2)}%"
+                    "reason": f"fallback bearish vs close {round(chg, 2)}%",
+                    "bull_score": 0,
+                    "bear_score": 55,
+                    "transition_scan": False,
+                    "transition_sides": ["PE"]
                 }
 
         return {
@@ -648,7 +664,11 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
             "option_side": None,
             "score": 0,
             "candle_count": len(candles or []),
-            "reason": "not enough index candle data"
+            "reason": "not enough index candle data",
+            "bull_score": 0,
+            "bear_score": 0,
+            "transition_scan": False,
+            "transition_sides": []
         }
 
     last = candles[-1]
@@ -735,7 +755,11 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
             "bias": "BULLISH",
             "option_side": "CE",
             "score": min(score_bull, 95),
-            "reason": ", ".join(bull)
+            "reason": ", ".join(bull),
+            "bull_score": score_bull,
+            "bear_score": score_bear,
+            "transition_scan": False,
+            "transition_sides": ["CE"]
         }
 
     if score_bear >= 55 and score_bear > score_bull:
@@ -744,23 +768,42 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
             "bias": "BEARISH",
             "option_side": "PE",
             "score": min(score_bear, 95),
-            "reason": ", ".join(bear)
+            "reason": ", ".join(bear),
+            "bull_score": score_bull,
+            "bear_score": score_bear,
+            "transition_scan": False,
+            "transition_sides": ["PE"]
         }
+
+    neutral_score = max(score_bull, score_bear)
+    transition_sides = []
+    if neutral_score >= TRANSITION_SCAN_MIN_SCORE:
+        # If both sides are close, scan both. Otherwise scan the stronger side.
+        if abs(score_bull - score_bear) <= 10:
+            transition_sides = ["CE", "PE"]
+        elif score_bull > score_bear:
+            transition_sides = ["CE"]
+        else:
+            transition_sides = ["PE"]
 
     return {
         **base,
         "bias": "NEUTRAL",
         "option_side": None,
-        "score": max(score_bull, score_bear),
-        "reason": "index structure not clean enough"
+        "score": neutral_score,
+        "bull_score": score_bull,
+        "bear_score": score_bear,
+        "transition_scan": bool(transition_sides),
+        "transition_sides": transition_sides,
+        "reason": "index structure not clean enough; transition option scan enabled" if transition_sides else "index structure not clean enough"
     }
 
 
 def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name):
-    side = index_bias.get("option_side")
+    side = index_bias.get("option_side") or index_bias.get("forced_option_side")
 
     if side not in ["CE", "PE"]:
-        return {"bias": "NO TRADE", "confidence": 0, "reason": "index neutral"}
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "index side unavailable"}
 
     if opt.get("type") != side:
         return {"bias": "NO TRADE", "confidence": 0, "reason": "option side not aligned"}
@@ -791,6 +834,8 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         score += 20
     elif idx_score >= 55:
         score += 12
+    elif index_bias.get("transition_scan") and idx_score >= TRANSITION_SCAN_MIN_SCORE:
+        score += 5
 
     reasons.append(index_bias.get("reason", ""))
 
@@ -1043,7 +1088,15 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     index_bias["index"] = index
 
     side = index_bias.get("option_side")
-    if side not in ["CE", "PE"]:
+    transition_sides = index_bias.get("transition_sides", []) if index_bias.get("transition_scan") else []
+
+    if side in ["CE", "PE"]:
+        sides_to_scan = [side]
+    elif transition_sides:
+        # During transition, scan only ATM/near-ATM strikes for the stronger side(s).
+        # Final trade still requires option premium breakout/hold and confidence >= CONFIDENCE_MIN.
+        sides_to_scan = transition_sides
+    else:
         return {
             "index": index,
             "spot_ltp": spot_data["ltp"],
@@ -1058,7 +1111,12 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             "reason": "index neutral, option scan skipped",
         }
 
-    side_options = [opt for opt in options if opt["type"] == side]
+    # Keep RIGA option buying ATM-first. In transition mode restrict to ATM/near-ATM only.
+    max_distance = INDEX_CONFIG[index]["step"] * (TRANSITION_STRIKES_AROUND if side not in ["CE", "PE"] else MAX_SCAN_STRIKES_AROUND)
+    side_options = [
+        opt for opt in options
+        if opt["type"] in sides_to_scan and abs(opt["strike"] - atm) <= max_distance
+    ]
     option_debug_summary["side_options_found"] = len(side_options)
 
     trades = []
@@ -1095,7 +1153,16 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             option_debug_summary["options_with_candles"] += 1
             scanned += 1
 
-        signal = analyze_option_buy_setup(index_bias, opt, ltp_data, opt_candles, atm, index)
+        effective_index_bias = dict(index_bias)
+        if effective_index_bias.get("option_side") not in ["CE", "PE"]:
+            effective_index_bias["forced_option_side"] = opt.get("type")
+            effective_index_bias["bias"] = "BULLISH" if opt.get("type") == "CE" else "BEARISH"
+            effective_index_bias["reason"] = (
+                f"transition scan; option premium confirmation required; "
+                f"{effective_index_bias.get('reason', '')}"
+            )
+
+        signal = analyze_option_buy_setup(effective_index_bias, opt, ltp_data, opt_candles, atm, index)
 
         if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= CONFIDENCE_MIN:
             trades.append({
