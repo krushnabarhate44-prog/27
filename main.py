@@ -26,7 +26,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.4")
+app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.5")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -1069,6 +1069,57 @@ def select_best_trade(trades):
 # Core scan functions
 # -----------------------------
 
+
+def build_index_candle_fallback_bias(index: str, spot_data: Dict[str, Any], candles: List[Dict[str, Any]], freshness_reason: str) -> Dict[str, Any]:
+    """
+    Premium-led fallback for live market when index candles are missing/stale.
+
+    Purpose:
+    - Do not block the full scanner only because Angel index historical candles failed.
+    - Scan only ATM/near-ATM CE/PE.
+    - Final trade is still allowed ONLY if option premium gives breakout/retest/higher-low confirmation
+      with confidence >= CONFIDENCE_MIN and valid structure-based RR.
+    """
+    ltp = spot_data.get("ltp")
+    close = spot_data.get("close")
+    transition_sides = ["CE", "PE"]
+    score = 35
+    direction_note = "spot direction unavailable"
+
+    if safe_num(ltp) and safe_num(close) and close:
+        chg = pct_change(float(ltp), float(close))
+        direction_note = f"spot vs previous close {round(chg, 2)}%"
+
+        # Prefer one side when spot move is clearly directional, but keep it premium-led.
+        if chg >= 0.12:
+            transition_sides = ["CE"]
+            score = 45 if chg < 0.40 else 50
+        elif chg <= -0.12:
+            transition_sides = ["PE"]
+            score = 45 if chg > -0.40 else 50
+
+    return {
+        "bias": "NEUTRAL",
+        "option_side": None,
+        "score": score,
+        "bull_score": score if transition_sides == ["CE"] else 0,
+        "bear_score": score if transition_sides == ["PE"] else 0,
+        "candle_count": len(candles or []),
+        "last_candle": candles[-1] if candles else None,
+        "trap": "index candle unavailable",
+        "volume_available": False,
+        "transition_scan": True,
+        "transition_sides": transition_sides,
+        "fallback_mode": True,
+        "freshness_reason": freshness_reason,
+        "reason": (
+            f"index candles unavailable/stale ({freshness_reason}); "
+            f"{direction_note}; premium-led ATM/near-ATM option scan enabled"
+        ),
+        "index": index,
+    }
+
+
 def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MINUTE", debug: bool = False):
     index = index.upper()
 
@@ -1101,28 +1152,41 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     }
 
     if not fresh:
-        return {
-            "index": index,
-            "spot_ltp": spot_data["ltp"],
-            "spot_close": spot_data.get("close"),
-            "index_bias": {
-                "bias": "MARKET_CLOSED" if "MARKET_" in freshness_reason else "STALE_DATA",
-                "option_side": None,
-                "score": 0,
-                "candle_count": len(index_candles or []),
-                "last_candle": index_candles[-1] if index_candles else None,
-                "reason": freshness_reason,
-                "index": index,
-            },
-            "atm": atm,
-            "nearest_expiry": expiry,
-            **option_debug_summary,
-            "total_options_scanned": 0,
-            "trade_count": 0,
-            "best_trade": "NO TRADE",
-        }
+        session = market_session_status()
 
-    index_bias = analyze_index_structure(index, spot_data, index_candles)
+        # Do not scan outside live market. This prevents stale previous-session trades.
+        if not session["is_open"]:
+            return {
+                "index": index,
+                "spot_ltp": spot_data["ltp"],
+                "spot_close": spot_data.get("close"),
+                "index_bias": {
+                    "bias": "MARKET_CLOSED",
+                    "option_side": None,
+                    "score": 0,
+                    "candle_count": len(index_candles or []),
+                    "last_candle": index_candles[-1] if index_candles else None,
+                    "reason": freshness_reason,
+                    "index": index,
+                },
+                "atm": atm,
+                "nearest_expiry": expiry,
+                "index_candle_fresh": fresh,
+                "freshness_reason": freshness_reason,
+                **option_debug_summary,
+                "total_options_scanned": 0,
+                "trade_count": 0,
+                "best_trade": "NO TRADE",
+            }
+
+        # Live-market fallback: index candles failed/stale, but option candles may still be valid.
+        # Scan ATM/near-ATM option premium and let option structure decide.
+        index_bias = build_index_candle_fallback_bias(index, spot_data, index_candles, freshness_reason)
+    else:
+        index_bias = analyze_index_structure(index, spot_data, index_candles)
+        index_bias["fallback_mode"] = False
+        index_bias["freshness_reason"] = freshness_reason
+
     index_bias["index"] = index
 
     side = index_bias.get("option_side")
@@ -1230,6 +1294,8 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         "index_bias": index_bias,
         "atm": atm,
         "nearest_expiry": expiry,
+        "index_candle_fresh": fresh,
+        "freshness_reason": freshness_reason,
         **option_debug_summary,
         "total_options_scanned": scanned,
         "trade_count": len(trades),
@@ -1250,7 +1316,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "10.4",
+        "version": "10.5",
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
@@ -1493,6 +1559,8 @@ def scan_all_markets(
                 "index_bias": res.get("index_bias"),
                 "atm": res.get("atm"),
                 "nearest_expiry": res.get("nearest_expiry"),
+                "index_candle_fresh": res.get("index_candle_fresh"),
+                "freshness_reason": res.get("freshness_reason"),
                 "total_options_found": res.get("total_options_found"),
                 "side_options_found": res.get("side_options_found"),
                 "candle_requests": res.get("candle_requests"),
