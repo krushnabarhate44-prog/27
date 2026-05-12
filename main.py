@@ -26,7 +26,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.2")
+app = FastAPI(title="RIGA AI Option Buying Scanner v10", version="10.4")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -51,9 +51,10 @@ MIN_CANDLES = 8
 # Do not skip option-premium scan only because the last index candle is weak/indecisive.
 # If the broader index score is near directional, scan ATM/near-ATM CE and PE and let
 # option premium structure decide. This improves opportunity capture without forcing trades.
-TRANSITION_SCAN_MIN_SCORE = 40
+TRANSITION_SCAN_MIN_SCORE = 25
 TRANSITION_STRIKES_AROUND = 1
 MAX_SCAN_STRIKES_AROUND = 6
+PREMIUM_LED_SCAN_ALWAYS = True
 
 client_obj = None
 scrip_master_cache = None
@@ -777,14 +778,22 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
 
     neutral_score = max(score_bull, score_bear)
     transition_sides = []
+
+    # Productive scanner fix:
+    # Earlier 35-40 score zones skipped option scanning completely.
+    # In intraday options, this misses many valid trades where index is consolidating
+    # but ATM option premium is already breaking out / holding VWAP.
     if neutral_score >= TRANSITION_SCAN_MIN_SCORE:
-        # If both sides are close, scan both. Otherwise scan the stronger side.
-        if abs(score_bull - score_bear) <= 10:
+        if abs(score_bull - score_bear) <= 15:
             transition_sides = ["CE", "PE"]
         elif score_bull > score_bear:
             transition_sides = ["CE"]
         else:
             transition_sides = ["PE"]
+    elif PREMIUM_LED_SCAN_ALWAYS:
+        # Very weak index: do only premium-led ATM scan on both sides.
+        # Final signal still needs option premium score >= CONFIDENCE_MIN.
+        transition_sides = ["CE", "PE"]
 
     return {
         **base,
@@ -795,7 +804,7 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
         "bear_score": score_bear,
         "transition_scan": bool(transition_sides),
         "transition_sides": transition_sides,
-        "reason": "index structure not clean enough; transition option scan enabled" if transition_sides else "index structure not clean enough"
+        "reason": "premium-led transition scan enabled; option premium must confirm" if transition_sides else "index structure not clean enough"
     }
 
 
@@ -833,28 +842,42 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     if idx_score >= 70:
         score += 20
     elif idx_score >= 55:
-        score += 12
+        score += 14
     elif index_bias.get("transition_scan") and idx_score >= TRANSITION_SCAN_MIN_SCORE:
-        score += 5
+        score += 8
+    elif index_bias.get("transition_scan"):
+        score += 3
 
     reasons.append(index_bias.get("reason", ""))
 
     if not levels:
         return {"bias": "NO TRADE", "confidence": score, "reason": "no swing levels"}
 
+    recent3 = candles[-4:-1] if len(candles) >= 4 else candles[:-1]
+    recent3_lows = [c["low"] for c in recent3] or [candles[-2]["low"]]
+    prev = candles[-2]
+
     if last["close"] > levels["prev_high"]:
-        score += 25
+        score += 30
         reasons.append("premium breakout above swing high")
         pattern = "PREMIUM_BREAKOUT"
+    elif vwap and last["low"] <= vwap * 1.004 and last["close"] > vwap and is_bull_candle(last):
+        score += 24
+        reasons.append("premium VWAP retest hold")
+        pattern = "PREMIUM_RETEST_HOLD"
+    elif vwap and last["low"] > min(recent3_lows) and last["close"] > prev["close"] and last["close"] > vwap:
+        score += 20
+        reasons.append("premium higher-low continuation above VWAP")
+        pattern = "PREMIUM_HIGHER_LOW"
     elif vwap and last["close"] > vwap and last["close"] > candles[-2]["close"]:
-        score += 10
+        score += 16
         reasons.append("premium continuation above VWAP")
         pattern = "PREMIUM_CONTINUATION"
     else:
         return {
             "bias": "NO TRADE",
             "confidence": score,
-            "reason": "premium breakout not activated",
+            "reason": "premium has no breakout/retest/higher-low confirmation",
             "candle_count": len(candles)
         }
 
@@ -887,25 +910,28 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             }
 
     if cq == "A_PLUS_BULL":
-        score += 20
+        score += 22
         reasons.append("A+ bullish premium candle")
     elif cq == "A_BULL":
-        score += 15
+        score += 18
         reasons.append("A grade bullish premium candle")
+    elif cq == "B_BULL" and pattern in ["PREMIUM_BREAKOUT", "PREMIUM_RETEST_HOLD", "PREMIUM_HIGHER_LOW"]:
+        score += 12
+        reasons.append("B bullish premium candle with structure confirmation")
     else:
         return {
             "bias": "NO TRADE",
             "confidence": score,
             "pattern": pattern,
             "candle": cq,
-            "reason": "premium candle quality not strong"
+            "reason": "premium candle quality not strong enough"
         }
 
     if mom > 0.25:
-        score += 15
+        score += 16
         reasons.append(f"strong premium momentum {round(mom, 2)}%")
     elif mom > 0.08:
-        score += 8
+        score += 10
         reasons.append(f"premium momentum {round(mom, 2)}%")
 
     if vwap and last["close"] > vwap:
@@ -916,16 +942,28 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         score += 10
         reasons.append(f"volume expansion {vol_ratio}x")
 
-    trap, trap_reason = trap_filter(last)
-    if trap:
+    # For option buying, lower-wick rejection after retest is often support absorption,
+    # so reject only weak body or upper-wick supply rejection.
+    body = max(candle_body(last), 0.01)
+    if candle_strength(last) < 0.30:
         return {
             "bias": "NO TRADE",
-            "confidence": max(score - 25, 0),
+            "confidence": max(score - 20, 0),
             "pattern": pattern,
             "candle": cq,
-            "trap_filter": trap_reason,
-            "reason": f"trap rejected: {trap_reason}"
+            "trap_filter": "weak body / indecision",
+            "reason": "trap rejected: weak body / indecision"
         }
+    if upper_wick(last) > body * 2.0 and candle_position(last) < 0.70:
+        return {
+            "bias": "NO TRADE",
+            "confidence": max(score - 20, 0),
+            "pattern": pattern,
+            "candle": cq,
+            "trap_filter": "upper wick rejection / fake breakout risk",
+            "reason": "trap rejected: upper wick rejection / fake breakout risk"
+        }
+    trap_reason = "no trap"
 
     step = INDEX_CONFIG[index_name]["step"]
     atm_distance = abs(opt["strike"] - atm)
@@ -1212,7 +1250,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "10.2",
+        "version": "10.4",
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
