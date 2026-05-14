@@ -3,7 +3,7 @@
   "info": {
     "title": "RIGA AI Option Buying Scanner",
     "version": "11.1.0",
-    "description": "RIGA AI option buying scanner. Bullish setup returns BUY CE, bearish setup returns BUY PE, otherwise NO TRADE."
+    "description": "RIGA AI compact option-buying scanner. Bullish setup returns BUY CE, bearish setup returns BUY PE, otherwise NO TRADE."
   },
   "servers": [
     {
@@ -50,7 +50,7 @@
       "get": {
         "operationId": "quickScan",
         "summary": "Quick final market scan",
-        "description": "Returns compact final RIGA scan output with stable JSON structure. Best endpoint for ChatGPT direct scan.",
+        "description": "Returns compact final RIGA scan output with stable JSON structure. Use this for all direct market scan requests.",
         "parameters": [
           {
             "name": "token",
@@ -107,113 +107,42 @@
                       "type": "string"
                     },
                     "bias": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     },
                     "option_trade": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     },
                     "index": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     },
                     "symbol": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     },
                     "strike": {
-                      "type": [
-                        "integer",
-                        "null"
-                      ]
+                      "type": "integer"
                     },
                     "option_type": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     },
                     "expiry": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     },
                     "entry": {
-                      "type": [
-                        "number",
-                        "null"
-                      ]
+                      "type": "number"
                     },
                     "sl": {
-                      "type": [
-                        "number",
-                        "null"
-                      ]
+                      "type": "number"
                     },
                     "targets": {
-                      "type": [
-                        "object",
-                        "null"
-                      ]
+                      "type": "object"
                     },
                     "confidence": {
                       "type": "number"
                     },
                     "reason": {
-                      "type": [
-                        "string",
-                        "null"
-                      ]
+                      "type": "string"
                     }
                   }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/quickScanText": {
-      "get": {
-        "operationId": "quickScanText",
-        "summary": "Quick final market scan in text format",
-        "description": "Returns compact human-readable scan result.",
-        "parameters": [
-          {
-            "name": "token",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "strikes_around",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 3
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Text scan result",
-            "content": {
-              "text/plain": {
-                "schema": {
-                  "type": "string"
                 }
               }
             }
@@ -285,169 +214,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/option-chain": {
-      "get": {
-        "operationId": "getOptionChain",
-        "summary": "Get option chain",
-        "parameters": [
-          {
-            "name": "index",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "NIFTY",
-                "BANKNIFTY",
-                "FINNIFTY",
-                "SENSEX"
-              ]
-            }
-          },
-          {
-            "name": "strikes_around",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 3
-            }
-          },
-          {
-            "name": "include_premium",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false
-            }
-          },
-          {
-            "name": "token",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Option chain response"
-          }
-        }
-      }
-    },
-    "/scan-options": {
-      "get": {
-        "operationId": "scanOptions",
-        "summary": "Scan one index for option-buying setup",
-        "parameters": [
-          {
-            "name": "index",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "enum": [
-                "NIFTY",
-                "BANKNIFTY",
-                "FINNIFTY",
-                "SENSEX"
-              ]
-            }
-          },
-          {
-            "name": "strikes_around",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 3
-            }
-          },
-          {
-            "name": "interval",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "FIVE_MINUTE"
-            }
-          },
-          {
-            "name": "debug",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false
-            }
-          },
-          {
-            "name": "token",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Single index scan result"
-          }
-        }
-      }
-    },
-    "/scan-all-options": {
-      "get": {
-        "operationId": "scanAllMarkets",
-        "summary": "Scan full market",
-        "parameters": [
-          {
-            "name": "strikes_around",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 3
-            }
-          },
-          {
-            "name": "interval",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string",
-              "default": "FIVE_MINUTE"
-            }
-          },
-          {
-            "name": "debug",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false
-            }
-          },
-          {
-            "name": "token",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Full market scan"
           }
         }
       }
