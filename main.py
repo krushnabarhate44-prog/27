@@ -1,5 +1,5 @@
 """
-RIGA AI - Final main.py v11.1
+RIGA AI - Final main.py v11.2
 Book/PDF-based option buying scanner with Angel One SmartAPI
 
 Rules:
@@ -26,7 +26,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11.1", version="11.1")
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.1", version="11.2")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -1415,7 +1415,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "11.1",
+        "version": "11.2",
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
@@ -1430,8 +1430,11 @@ def health():
         "routes": [
             "/getSpotPrice",
             "/getOptionChain",
+            "/marketPremiums",
             "/scanOptions",
             "/scanAllMarkets",
+            "/quickScan",
+            "/quickScanText",
             "/candles-test",
             "/option-candles-test",
         ],
@@ -1589,6 +1592,131 @@ def option_chain_alias(
         index=index,
         strikes_around=strikes_around,
         include_premium=include_premium,
+        authorization=authorization,
+        token=token,
+    )
+
+
+def _premium_payload(opt: Dict[str, Any], premium: Optional[Dict[str, Any]], atm: int) -> Dict[str, Any]:
+    """Compact stable option premium payload for UI/action use."""
+    p = premium or {}
+    ltp = p.get("ltp") if isinstance(p, dict) else None
+    close = p.get("close") if isinstance(p, dict) else None
+
+    change = None
+    change_pct = None
+    if safe_num(ltp) and safe_num(close) and close:
+        change = round(float(ltp) - float(close), 2)
+        change_pct = round(pct_change(float(ltp), float(close)), 2)
+
+    return {
+        "symbol": opt.get("tradingsymbol"),
+        "exchange": opt.get("exchange"),
+        "token": str(opt.get("symboltoken")),
+        "strike": opt.get("strike"),
+        "type": opt.get("type"),
+        "expiry": opt.get("expiry"),
+        "atm_distance": abs(int(opt.get("strike", 0)) - int(atm)),
+        "ltp": ltp,
+        "open": p.get("open") if isinstance(p, dict) else None,
+        "high": p.get("high") if isinstance(p, dict) else None,
+        "low": p.get("low") if isinstance(p, dict) else None,
+        "close": close,
+        "change": change,
+        "change_pct": change_pct,
+    }
+
+
+def _market_premiums_for_index(client, index: str, strikes_around: int = 1) -> Dict[str, Any]:
+    index = index.upper()
+
+    if index not in INDEX_CONFIG:
+        return {
+            "status": "error",
+            "index": index,
+            "reason": "Invalid index",
+        }
+
+    spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
+    if not spot_data or not safe_num(spot_data.get("ltp")):
+        return {
+            "status": "error",
+            "index": index,
+            "reason": "Spot data failed",
+        }
+
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
+
+    rows = []
+    for opt in options:
+        premium = get_ltp(client, opt)
+        rows.append(_premium_payload(opt, premium, atm))
+
+    # ATM first, then nearest strikes; CE before PE for same strike.
+    rows.sort(key=lambda x: (x["atm_distance"], x["strike"], 0 if x["type"] == "CE" else 1))
+
+    atm_ce = next((x for x in rows if x["strike"] == atm and x["type"] == "CE"), None)
+    atm_pe = next((x for x in rows if x["strike"] == atm and x["type"] == "PE"), None)
+
+    return {
+        "status": "ok",
+        "index": index,
+        "spot_ltp": spot_data.get("ltp"),
+        "spot_close": spot_data.get("close"),
+        "atm": atm,
+        "nearest_expiry": expiry,
+        "atm_ce": atm_ce,
+        "atm_pe": atm_pe,
+        "options_count": len(rows),
+        "options": rows,
+    }
+
+
+@app.get("/marketPremiums")
+def market_premiums(
+    index: Optional[str] = Query(None),
+    strikes_around: int = Query(1),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    """
+    Returns current spot, ATM strike and CE/PE option premium LTP.
+
+    Examples:
+    /marketPremiums?token=YOUR_TOKEN
+    /marketPremiums?index=NIFTY&strikes_around=1&token=YOUR_TOKEN
+    """
+    check_token(authorization, token)
+
+    client = get_client()
+    strikes_around = max(0, min(int(strikes_around), 6))
+
+    indexes = [index.upper()] if index else ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
+    markets = {}
+
+    for idx in indexes:
+        markets[idx] = _market_premiums_for_index(client, idx, strikes_around)
+
+    return {
+        "status": "ok",
+        "version": "11.2",
+        "server_time": now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
+        "market_session": market_session_status(),
+        "strikes_around": strikes_around,
+        "markets": markets,
+    }
+
+
+@app.get("/market-premiums")
+def market_premiums_alias(
+    index: Optional[str] = Query(None),
+    strikes_around: int = Query(1),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    return market_premiums(
+        index=index,
+        strikes_around=strikes_around,
         authorization=authorization,
         token=token,
     )
@@ -1771,7 +1899,7 @@ def scan_all_markets(
 
     return {
         "status": "ok",
-        "version": "11.1",
+        "version": "11.2",
         "trade_available": overall_payload.get("trade_available", False),
         "result": overall_payload.get("result", "NO TRADE"),
         # Stable object only, never string.
