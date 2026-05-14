@@ -1,5 +1,5 @@
 """
-RIGA AI - Final main.py v10
+RIGA AI - Final main.py v11.1
 Book/PDF-based option buying scanner with Angel One SmartAPI
 
 Rules:
@@ -26,7 +26,7 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11", version="11.0")
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.1", version="11.1")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -1415,7 +1415,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "11.0",
+        "version": "11.1",
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
@@ -1626,6 +1626,68 @@ def scan_options_alias(
     )
 
 
+
+def empty_trade_payload(reason: str = "No valid setup") -> Dict[str, Any]:
+    """
+    Stable no-trade payload.
+    Important: do not return mixed string/object types for actions/plugins.
+    """
+    return {
+        "trade_available": False,
+        "result": "NO TRADE",
+        "bias": "NEUTRAL",
+        "option_trade": None,
+        "index": None,
+        "symbol": None,
+        "strike": None,
+        "entry": None,
+        "sl": None,
+        "targets": None,
+        "confidence": 0,
+        "reason": reason,
+    }
+
+
+def trade_to_payload(trade: Any) -> Dict[str, Any]:
+    """
+    Convert internal raw trade object into one stable flat schema.
+    """
+    if not isinstance(trade, dict):
+        return empty_trade_payload()
+
+    sig = trade.get("signal", {}) or {}
+    opt = trade.get("option", {}) or {}
+    bias = sig.get("bias")
+
+    if bias not in ["BUY_CE", "BUY_PE"]:
+        return empty_trade_payload(sig.get("reason", "No valid setup"))
+
+    return {
+        "trade_available": True,
+        "result": bias,
+        "bias": "Bullish" if bias == "BUY_CE" else "Bearish",
+        "option_trade": "BUY CE" if bias == "BUY_CE" else "BUY PE",
+        "index": trade.get("index"),
+        "symbol": opt.get("tradingsymbol"),
+        "strike": opt.get("strike"),
+        "option_type": opt.get("type"),
+        "expiry": opt.get("expiry"),
+        "entry": sig.get("entry"),
+        "sl": sig.get("sl"),
+        "targets": sig.get("targets"),
+        "target": sig.get("target"),
+        "risk": sig.get("risk"),
+        "risk_pct": sig.get("risk_pct"),
+        "confidence": sig.get("confidence"),
+        "pattern": sig.get("pattern"),
+        "candle": sig.get("candle"),
+        "momentum_pct": sig.get("momentum_pct"),
+        "premium_vwap": sig.get("premium_vwap"),
+        "atm_distance": sig.get("atm_distance"),
+        "reason": sig.get("reason"),
+    }
+
+
 @app.get("/scanAllMarkets")
 def scan_all_markets(
     strikes_around: int = Query(3),
@@ -1636,8 +1698,8 @@ def scan_all_markets(
 ):
     check_token(authorization, token)
 
-    markets = {}
-    valid_trades = []
+    markets: Dict[str, Any] = {}
+    valid_trades: List[Dict[str, Any]] = []
 
     for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
         try:
@@ -1648,14 +1710,20 @@ def scan_all_markets(
                 debug=debug,
             )
 
-            best = res.get("best_trade")
-            if isinstance(best, dict) and best.get("signal", {}).get("bias") in ["BUY_CE", "BUY_PE"]:
-                valid_trades.append(best)
+            raw_best = res.get("best_trade")
+            best_payload = trade_to_payload(raw_best)
 
-            # Compact output only to avoid ResponseTooLargeError
+            if best_payload.get("trade_available"):
+                valid_trades.append(raw_best)
+
+            index_bias = res.get("index_bias") or {}
             markets[idx] = {
+                "status": "ok",
                 "spot_ltp": res.get("spot_ltp"),
-                "index_bias": res.get("index_bias"),
+                "spot_close": res.get("spot_close"),
+                "bias": index_bias.get("bias"),
+                "index_score": index_bias.get("score"),
+                "index_reason": index_bias.get("reason"),
                 "atm": res.get("atm"),
                 "nearest_expiry": res.get("nearest_expiry"),
                 "index_candle_fresh": res.get("index_candle_fresh"),
@@ -1668,26 +1736,135 @@ def scan_all_markets(
                 "options_with_insufficient_candles": res.get("options_with_insufficient_candles"),
                 "total_options_scanned": res.get("total_options_scanned"),
                 "trade_count": res.get("trade_count"),
-                "best_trade": best,
+                # Stable object only, never string.
+                "best_trade": best_payload,
             }
 
             if debug and res.get("rejected"):
-                markets[idx]["rejected"] = res.get("rejected")
+                markets[idx]["rejected"] = res.get("rejected")[:10]
 
         except Exception as exc:
             markets[idx] = {
+                "status": "error",
                 "spot_ltp": None,
-                "index_bias": {"bias": "ERROR", "reason": str(exc)},
+                "spot_close": None,
+                "bias": "ERROR",
+                "index_score": 0,
+                "index_reason": str(exc),
                 "atm": None,
+                "nearest_expiry": None,
+                "index_candle_fresh": False,
+                "freshness_reason": "ERROR",
+                "total_options_found": 0,
+                "side_options_found": 0,
+                "candle_requests": 0,
+                "options_with_candles": 0,
+                "options_without_candles": 0,
+                "options_with_insufficient_candles": 0,
+                "total_options_scanned": 0,
                 "trade_count": 0,
-                "best_trade": "NO TRADE",
+                "best_trade": empty_trade_payload(str(exc)),
             }
 
-    overall_best = select_best_trade(valid_trades)
+    raw_overall_best = select_best_trade(valid_trades)
+    overall_payload = trade_to_payload(raw_overall_best)
 
     return {
-        "overall_best_trade": overall_best if overall_best else "NO TRADE",
+        "status": "ok",
+        "version": "11.1",
+        "trade_available": overall_payload.get("trade_available", False),
+        "result": overall_payload.get("result", "NO TRADE"),
+        # Stable object only, never string.
+        "overall_best_trade": overall_payload,
         "markets": markets,
+    }
+
+
+@app.get("/quickScan")
+def quick_scan(
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    """
+    Lightweight endpoint for ChatGPT Actions / plugins.
+    Always returns one small stable JSON schema.
+    """
+    data = scan_all_markets(
+        strikes_around=strikes_around,
+        interval=interval,
+        debug=False,
+        authorization=authorization,
+        token=token,
+    )
+
+    best = data.get("overall_best_trade") or empty_trade_payload()
+    return {
+        "status": data.get("status", "ok"),
+        "version": data.get("version", "11.1"),
+        "trade_available": best.get("trade_available", False),
+        "result": best.get("result", "NO TRADE"),
+        "bias": best.get("bias"),
+        "option_trade": best.get("option_trade"),
+        "index": best.get("index"),
+        "symbol": best.get("symbol"),
+        "strike": best.get("strike"),
+        "option_type": best.get("option_type"),
+        "expiry": best.get("expiry"),
+        "entry": best.get("entry"),
+        "sl": best.get("sl"),
+        "targets": best.get("targets"),
+        "confidence": best.get("confidence"),
+        "reason": best.get("reason"),
+    }
+
+
+@app.get("/quickScanText")
+def quick_scan_text(
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    """
+    Human-readable compact endpoint.
+    """
+    data = quick_scan(
+        strikes_around=strikes_around,
+        interval=interval,
+        authorization=authorization,
+        token=token,
+    )
+
+    if not data.get("trade_available"):
+        return {
+            "text": (
+                "NO TRADE\n"
+                "Market:\n"
+                "Bias: Bullish / Bearish not confirmed\n"
+                "Option Trade: NO TRADE\n"
+                "Strike: —\n"
+                "Entry: —\n"
+                "Stop Loss: —\n"
+                "Target: —\n"
+                f"Confidence: {data.get('confidence', 0)}%\n"
+                f"Reason: {data.get('reason') or 'No valid setup'}"
+            )
+        }
+
+    return {
+        "text": (
+            "Market:\n"
+            f"Bias: {data.get('bias')}\n"
+            f"Option Trade: {data.get('option_trade')}\n"
+            f"Strike: {data.get('symbol') or data.get('strike')}\n"
+            f"Entry: {data.get('entry')}\n"
+            f"Stop Loss: {data.get('sl')}\n"
+            f"Target: {data.get('targets')}\n"
+            f"Confidence: {data.get('confidence')}%\n"
+            f"Reason: {data.get('reason')}"
+        )
     }
 
 
@@ -1754,4 +1931,4 @@ def format_riga_output(trade: Any) -> str:
 
 
 if __name__ == "__main__":
-    print("RIGA AI main.py v11 loaded. Run with: uvicorn main:app --reload")
+    print("RIGA AI main.py v11.1 loaded. Run with: uvicorn main:app --reload")
