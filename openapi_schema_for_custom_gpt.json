@@ -17,23 +17,7 @@
         "summary": "Check backend health",
         "responses": {
           "200": {
-            "description": "Backend health response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "status": { "type": "string" },
-                    "server_time": { "type": "string" },
-                    "market_session": { "type": "object" },
-                    "routes": {
-                      "type": "array",
-                      "items": { "type": "string" }
-                    }
-                  }
-                }
-              }
-            }
+            "description": "Backend health response"
           }
         }
       }
@@ -48,7 +32,9 @@
             "name": "token",
             "in": "query",
             "required": true,
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           },
           {
             "name": "strikes_around",
@@ -78,32 +64,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Compact final scan result",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "status": { "type": "string" },
-                    "version": { "type": "string" },
-                    "trade_available": { "type": "boolean" },
-                    "result": { "type": "string" },
-                    "bias": { "type": ["string", "null"] },
-                    "option_trade": { "type": ["string", "null"] },
-                    "index": { "type": ["string", "null"] },
-                    "symbol": { "type": ["string", "null"] },
-                    "strike": { "type": ["integer", "null"] },
-                    "option_type": { "type": ["string", "null"] },
-                    "expiry": { "type": ["string", "null"] },
-                    "entry": { "type": ["number", "null"] },
-                    "sl": { "type": ["number", "null"] },
-                    "targets": { "type": ["object", "null"] },
-                    "confidence": { "type": "number" },
-                    "reason": { "type": ["string", "null"] }
-                  }
-                }
-              }
-            }
+            "description": "Compact final scan result"
           }
         }
       }
@@ -143,44 +104,14 @@
             "name": "token",
             "in": "query",
             "required": true,
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Market premium table",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "status": { "type": "string" },
-                    "version": { "type": "string" },
-                    "checked_at": { "type": "string" },
-                    "markets": {
-                      "type": "object",
-                      "additionalProperties": {
-                        "type": "object",
-                        "properties": {
-                          "status": { "type": "string" },
-                          "index": { "type": "string" },
-                          "spot_ltp": { "type": ["number", "null"] },
-                          "spot_close": { "type": ["number", "null"] },
-                          "atm": { "type": ["integer", "null"] },
-                          "nearest_expiry": { "type": ["string", "null"] },
-                          "atm_ce": { "type": ["object", "null"] },
-                          "atm_pe": { "type": ["object", "null"] },
-                          "options": {
-                            "type": "array",
-                            "items": { "type": "object" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
+            "description": "Market premium table"
           }
         }
       }
@@ -208,29 +139,14 @@
             "name": "token",
             "in": "query",
             "required": true,
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Spot response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "properties": {
-                    "symbol": { "type": "string" },
-                    "exchange": { "type": "string" },
-                    "token": { "type": "string" },
-                    "ltp": { "type": "number" },
-                    "open": { "type": "number" },
-                    "high": { "type": "number" },
-                    "low": { "type": "number" },
-                    "close": { "type": "number" }
-                  }
-                }
-              }
-            }
+            "description": "Spot response"
           }
         }
       }
