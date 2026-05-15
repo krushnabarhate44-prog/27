@@ -27,7 +27,9 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11.2", version="11.2")
+APP_VERSION = "11.2"
+
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.2", version=APP_VERSION)
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -48,10 +50,6 @@ MIN_RISK_PCT = 2.0
 DEFAULT_BUFFER_PCT = 0.015
 MIN_CANDLES = 8
 
-# Transition scan:
-# Do not skip option-premium scan only because the last index candle is weak/indecisive.
-# If the broader index score is near directional, scan ATM/near-ATM CE and PE and let
-# option premium structure decide. This improves opportunity capture without forcing trades.
 TRANSITION_SCAN_MIN_SCORE = 45
 TRANSITION_STRIKES_AROUND = 1
 MAX_SCAN_STRIKES_AROUND = 3
@@ -60,10 +58,6 @@ PREMIUM_LED_SCAN_ALWAYS = False
 client_obj = None
 scrip_master_cache = None
 
-
-# One clean config only.
-# spot_token = LTP/quote token
-# hist_token = Angel historical candle token for index
 INDEX_CONFIG = {
     "NIFTY": {
         "spot": {"exchange": "NSE", "tradingsymbol": "NIFTY 50", "symboltoken": "26000", "hist_token": "99926000"},
@@ -120,16 +114,8 @@ def get_client():
         raise HTTPException(status_code=500, detail="Missing Angel credentials in Render/.env")
 
     client = SmartConnect(api_key=ANGEL_API_KEY)
-
-    totp = pyotp.TOTP(
-        ANGEL_TOTP_SECRET.strip().replace(" ", "").upper()
-    ).now()
-
-    session = client.generateSession(
-        ANGEL_CLIENT_CODE,
-        ANGEL_PASSWORD,
-        totp
-    )
+    totp = pyotp.TOTP(ANGEL_TOTP_SECRET.strip().replace(" ", "").upper()).now()
+    session = client.generateSession(ANGEL_CLIENT_CODE, ANGEL_PASSWORD, totp)
 
     if not session or not session.get("status"):
         raise HTTPException(status_code=500, detail=f"Angel login failed: {session}")
@@ -162,10 +148,6 @@ def last_trading_date(dt: datetime) -> datetime:
 
 
 def candle_window_ist():
-    """
-    Render may run UTC. Angel historical API needs IST.
-    Uses 09:15 to now during market, or previous trading session after close/before open.
-    """
     n = now_ist()
     d = last_trading_date(n)
 
@@ -185,10 +167,6 @@ def candle_window_ist():
 
 
 def market_session_status() -> Dict[str, Any]:
-    """
-    Prevent stale Friday/previous-day candles being treated as live scans.
-    Does not handle NSE/BSE holidays, but catches weekends and pre/post-market.
-    """
     n = now_ist()
     today_open = n.replace(hour=9, minute=15, second=0, microsecond=0)
     today_close = n.replace(hour=15, minute=30, second=0, microsecond=0)
@@ -219,7 +197,6 @@ def parse_candle_time(value: Any) -> Optional[datetime]:
         return None
 
     s = str(value)
-    # Angel often returns ISO like 2026-05-08T15:25:00+05:30
     try:
         dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
@@ -238,10 +215,6 @@ def parse_candle_time(value: Any) -> Optional[datetime]:
 
 
 def is_candle_data_fresh(candles: List[Dict[str, Any]], max_stale_minutes: int = 20) -> Tuple[bool, str]:
-    """
-    During market hours, last candle must be close to current IST time.
-    Off-market, scans should not generate trades.
-    """
     session = market_session_status()
     if not session["is_open"]:
         return False, session["status"]
@@ -278,10 +251,12 @@ def normalize_interval(interval: str) -> str:
 def get_ltp(client, item: Dict[str, Any]):
     try:
         res = client.ltpData(item["exchange"], item["tradingsymbol"], str(item["symboltoken"]))
-    except Exception:
+    except Exception as e:
+        print("LTP ERROR:", item, str(e))
         return None
 
     if not res or not res.get("status"):
+        print("LTP FAILED:", item, res)
         return None
 
     d = res.get("data", {}) or {}
@@ -311,10 +286,12 @@ def get_candles(client, exchange: str, symboltoken: str, interval: str = "FIVE_M
 
     try:
         res = client.getCandleData(params)
-    except Exception:
+    except Exception as e:
+        print("CANDLE ERROR:", params, str(e))
         return []
 
     if not res or not res.get("status"):
+        print("CANDLE FAILED:", params, res)
         return []
 
     candles = []
@@ -362,16 +339,7 @@ def get_candles_debug(client, exchange: str, symboltoken: str, interval: str = "
 
 
 def fetch_option_candles_debug(client, opt: Dict[str, Any], interval: str = "FIVE_MINUTE") -> Dict[str, Any]:
-    """
-    Debug helper for option premium candles.
-    Use this to verify whether Angel is returning candles for the exact option token.
-    """
-    dbg = get_candles_debug(
-        client,
-        opt.get("exchange", "NFO"),
-        str(opt.get("symboltoken")),
-        interval=interval,
-    )
+    dbg = get_candles_debug(client, opt.get("exchange", "NFO"), str(opt.get("symboltoken")), interval=interval)
     dbg["symbol"] = opt.get("tradingsymbol")
     dbg["strike"] = opt.get("strike")
     dbg["type"] = opt.get("type")
@@ -443,13 +411,6 @@ def is_bear_candle(c):
 
 
 def calc_vwap(candles: List[Dict[str, Any]]):
-    """
-    VWAP with fallback.
-
-    Angel index candles often return volume = 0.
-    In that case real VWAP cannot be calculated, so we use
-    typical-price average as a practical structure reference.
-    """
     if not candles:
         return None
 
@@ -460,7 +421,6 @@ def calc_vwap(candles: List[Dict[str, Any]]):
     for c in candles:
         tp = (c["high"] + c["low"] + c["close"]) / 3
         typical_prices.append(tp)
-
         v = c.get("volume", 0) or 0
         if v > 0:
             total_pv += tp * v
@@ -469,19 +429,14 @@ def calc_vwap(candles: List[Dict[str, Any]]):
     if total_v > 0:
         return total_pv / total_v
 
-    # Fallback when all volumes are zero.
-    # Not true VWAP, but better than null for trend/acceptance logic.
     return sum(typical_prices) / len(typical_prices)
 
 
 def find_swing_levels(candles: List[Dict[str, Any]], lookback: int = 20):
     recent = candles[-lookback:] if len(candles) >= lookback else candles
-
     if not recent:
         return None
-
     prev = recent[:-1] if len(recent) > 1 else recent
-
     return {
         "swing_high": max(c["high"] for c in recent),
         "swing_low": min(c["low"] for c in recent),
@@ -491,15 +446,6 @@ def find_swing_levels(candles: List[Dict[str, Any]], lookback: int = 20):
 
 
 def volume_spike(candles: List[Dict[str, Any]], lookback: int = 20):
-    """
-    Returns:
-    - spike_bool
-    - ratio
-    - available_bool
-
-    Angel index candles may have volume = 0.
-    If volume is unavailable, do not fail the setup; just mark unavailable.
-    """
     if len(candles) < 5:
         return False, 0.0, False
 
@@ -547,10 +493,8 @@ def trap_filter(c):
 
     if candle_strength(c) < 0.35:
         return True, "weak body / indecision"
-
     if uw > body * 1.8 and pos < 0.75:
         return True, "upper wick rejection / fake breakout risk"
-
     if lw > body * 1.8 and pos > 0.25:
         return True, "lower wick rejection / fake breakdown risk"
 
@@ -569,10 +513,8 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
 
     cfg = INDEX_CONFIG[index_name]
     master = load_scrip_master()
-
     atm = round_to_step(spot_price, cfg["step"])
     allowed = {atm + i * cfg["step"] for i in range(-strikes_around, strikes_around + 1)}
-
     today = now_ist().date()
     found = []
 
@@ -606,7 +548,6 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
                 "expiry": s.get("expiry"),
                 "expiry_dt": expiry_dt,
             })
-
         except Exception:
             continue
 
@@ -615,7 +556,6 @@ def get_auto_option_chain(index_name, spot_price, strikes_around=3):
 
     nearest = min(x["expiry_dt"] for x in found)
     options = [x for x in found if x["expiry_dt"] == nearest]
-
     for x in options:
         x.pop("expiry_dt", None)
 
@@ -634,7 +574,6 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
 
         if safe_num(ltp) and safe_num(close):
             chg = pct_change(ltp, close)
-
             if chg >= 0.12:
                 return {
                     "bias": "BULLISH",
@@ -645,9 +584,8 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
                     "bull_score": 55,
                     "bear_score": 0,
                     "transition_scan": False,
-                    "transition_sides": ["CE"]
+                    "transition_sides": ["CE"],
                 }
-
             if chg <= -0.12:
                 return {
                     "bias": "BEARISH",
@@ -658,7 +596,7 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
                     "bull_score": 0,
                     "bear_score": 55,
                     "transition_scan": False,
-                    "transition_sides": ["PE"]
+                    "transition_sides": ["PE"],
                 }
 
         return {
@@ -670,7 +608,7 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
             "bull_score": 0,
             "bear_score": 0,
             "transition_scan": False,
-            "transition_sides": []
+            "transition_sides": [],
         }
 
     last = candles[-1]
@@ -693,7 +631,6 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
     if intraday_change > 0.12:
         score_bull += 20
         bull.append(f"index intraday bullish {round(intraday_change, 2)}%")
-
     if intraday_change < -0.12:
         score_bear += 20
         bear.append(f"index intraday bearish {round(intraday_change, 2)}%")
@@ -709,17 +646,14 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
     if levels and last_close > levels["prev_high"]:
         score_bull += 25
         bull.append("index breakout above swing high")
-
     if levels and last_close < levels["prev_low"]:
         score_bear += 25
         bear.append("index breakdown below swing low")
 
     cq = classify_candle(last)
-
     if cq in ["A_PLUS_BULL", "A_BULL"]:
         score_bull += 15
         bull.append(f"index {cq}")
-
     if cq in ["A_PLUS_BEAR", "A_BEAR"]:
         score_bear += 15
         bear.append(f"index {cq}")
@@ -727,7 +661,6 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
     if last_momentum > 0.03:
         score_bull += 10
         bull.append("last candle bullish momentum")
-
     if last_momentum < -0.03:
         score_bear += 10
         bear.append("last candle bearish momentum")
@@ -761,7 +694,7 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
             "bull_score": score_bull,
             "bear_score": score_bear,
             "transition_scan": False,
-            "transition_sides": ["CE"]
+            "transition_sides": ["CE"],
         }
 
     if score_bear >= 55 and score_bear > score_bull:
@@ -774,16 +707,12 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
             "bull_score": score_bull,
             "bear_score": score_bear,
             "transition_scan": False,
-            "transition_sides": ["PE"]
+            "transition_sides": ["PE"],
         }
 
     neutral_score = max(score_bull, score_bear)
     transition_sides = []
 
-    # Productive scanner fix:
-    # Earlier 35-40 score zones skipped option scanning completely.
-    # In intraday options, this misses many valid trades where index is consolidating
-    # but ATM option premium is already breaking out / holding VWAP.
     if neutral_score >= TRANSITION_SCAN_MIN_SCORE:
         if abs(score_bull - score_bear) <= 15:
             transition_sides = ["CE", "PE"]
@@ -792,8 +721,6 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
         else:
             transition_sides = ["PE"]
     elif PREMIUM_LED_SCAN_ALWAYS:
-        # Very weak index: do only premium-led ATM scan on both sides.
-        # Final signal still needs option premium score >= CONFIDENCE_MIN.
         transition_sides = ["CE", "PE"]
 
     return {
@@ -805,51 +732,29 @@ def analyze_index_structure(index_name: str, spot_data: Dict[str, Any], candles:
         "bear_score": score_bear,
         "transition_scan": bool(transition_sides),
         "transition_sides": transition_sides,
-        "reason": "premium-led transition scan enabled; option premium must confirm" if transition_sides else "index structure not clean enough"
+        "reason": "premium-led transition scan enabled; option premium must confirm" if transition_sides else "index structure not clean enough",
     }
 
 
-
 def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name):
-    """
-    RIGA v11 strict execution logic.
-
-    Changes from v10.5:
-    - No direct breakout chase.
-    - No loose higher-low continuation entry.
-    - Retest/throwback hold is mandatory.
-    - Wide option-premium SL rejected above MAX_RISK_PCT.
-    - Confidence capped by index quality.
-    - LTP far from signal candle close rejected as stale/chase.
-    - T1 too far above option day high rejected as unrealistic RR.
-    """
     side = index_bias.get("option_side") or index_bias.get("forced_option_side")
 
     if side not in ["CE", "PE"]:
         return {"bias": "NO TRADE", "confidence": 0, "reason": "index side unavailable"}
-
     if opt.get("type") != side:
         return {"bias": "NO TRADE", "confidence": 0, "reason": "option side not aligned"}
-
     if not ltp_data or not safe_num(ltp_data.get("ltp")):
         return {"bias": "NO TRADE", "confidence": 0, "reason": "no option LTP"}
-
     if not candles or len(candles) < MIN_CANDLES:
-        return {
-            "bias": "NO TRADE",
-            "confidence": 0,
-            "reason": "not enough option candle data",
-            "candle_count": len(candles or [])
-        }
+        return {"bias": "NO TRADE", "confidence": 0, "reason": "not enough option candle data", "candle_count": len(candles or [])}
 
-    # Option candles must also be live/fresh.
     opt_fresh, opt_freshness_reason = is_candle_data_fresh(candles, max_stale_minutes=12)
     if not opt_fresh:
         return {
             "bias": "NO TRADE",
             "confidence": 0,
             "reason": f"option candle data not fresh: {opt_freshness_reason}",
-            "candle_count": len(candles or [])
+            "candle_count": len(candles or []),
         }
 
     last = candles[-1]
@@ -861,7 +766,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     entry = float(ltp_data["ltp"])
     last_close = float(last["close"])
 
-    # Avoid stale signal / chase entries where current LTP is away from signal candle close.
     ltp_distance_pct = abs(entry - last_close) / last_close * 100 if last_close else 999
     if ltp_distance_pct > 1.2:
         return {
@@ -881,7 +785,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     score = 0
     reasons = [index_bias.get("reason", "")]
 
-    # Index contribution is intentionally smaller than v10.5 to avoid inflated 95% scores.
     if idx_score >= 85:
         score += 20
     elif idx_score >= 70:
@@ -904,7 +807,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     mom = pct_change(last["close"], prev["close"])
     body = max(candle_body(last), 0.01)
 
-    # Strict late-chase rejection. A fast option candle is not an entry unless retest has already happened cleanly.
     if mom >= 3.0 and strength >= 0.75:
         return {
             "bias": "NO TRADE",
@@ -912,10 +814,9 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "candle": cq,
             "candle_strength": round(strength, 2),
             "momentum_pct": round(mom, 2),
-            "reason": "late momentum chase rejected; wait for retest"
+            "reason": "late momentum chase rejected; wait for retest",
         }
 
-    # Basic candle/trap filters before entry validation.
     if candle_strength(last) < 0.35:
         return {
             "bias": "NO TRADE",
@@ -936,15 +837,9 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "candle_count": len(candles),
         }
 
-    # Mandatory retest/throwback hold.
-    # Direct breakout or loose higher-low continuation is not enough in v11.
     retest_candidates = []
-
     if vwap:
         retest_candidates.append(("VWAP", float(vwap)))
-
-    # Previous swing high acts like breakout/throwback level for option premium strength.
-    # For PE also this is still premium chart resistance/support logic, not index direction.
     if levels.get("prev_high"):
         retest_candidates.append(("PREV_SWING_HIGH", float(levels["prev_high"])))
 
@@ -953,8 +848,7 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     for name, level in retest_candidates:
         if level <= 0:
             continue
-
-        tolerance = 0.006  # 0.6% retest zone
+        tolerance = 0.006
         held_level = (
             last["low"] <= level * (1 + tolerance)
             and last["close"] > level
@@ -965,7 +859,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
                 or candle_position(last) >= 0.70
             )
         )
-
         if held_level:
             retest_level_name = name
             retest_level = level
@@ -985,7 +878,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     score += 30
     reasons.append(f"premium retest/throwback hold at {retest_level_name}")
 
-    # Reject if option premium already too extended from VWAP.
     if vwap:
         distance_from_vwap = pct_change(entry, vwap)
         if distance_from_vwap > 5.0:
@@ -995,10 +887,9 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
                 "pattern": pattern,
                 "premium_vwap": round(vwap, 2),
                 "distance_from_vwap_pct": round(distance_from_vwap, 2),
-                "reason": "premium too extended from VWAP / chase rejected"
+                "reason": "premium too extended from VWAP / chase rejected",
             }
 
-    # Candle quality scoring, but no weak candle pass.
     if cq == "A_PLUS_BULL":
         score += 18
         reasons.append("A+ bullish premium candle")
@@ -1014,10 +905,9 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "confidence": score,
             "pattern": pattern,
             "candle": cq,
-            "reason": "premium candle quality not strong enough after retest"
+            "reason": "premium candle quality not strong enough after retest",
         }
 
-    # Momentum is useful, but too much momentum is chase. This already rejected >=3%.
     if 0.15 < mom < 3.0:
         score += 10
         reasons.append(f"controlled premium momentum {round(mom, 2)}%")
@@ -1033,13 +923,11 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         score += 8
         reasons.append(f"volume expansion {vol_ratio}x")
     else:
-        # Do not reject only because Angel volume is unavailable, but don't reward it.
         reasons.append("volume not confirmed")
 
     step = INDEX_CONFIG[index_name]["step"]
     atm_distance = abs(opt["strike"] - atm)
 
-    # ATM/near-ATM only. Far strikes are rejected, not just penalized.
     if atm_distance == 0:
         score += 10
         reasons.append("ATM strike")
@@ -1047,14 +935,8 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         score += 6
         reasons.append("near ATM strike")
     else:
-        return {
-            "bias": "NO TRADE",
-            "confidence": score,
-            "atm_distance": atm_distance,
-            "reason": "far from ATM rejected for option buying"
-        }
+        return {"bias": "NO TRADE", "confidence": score, "atm_distance": atm_distance, "reason": "far from ATM rejected for option buying"}
 
-    # Structure-based SL below recent option swing low with buffer.
     buffer = max(entry * DEFAULT_BUFFER_PCT, 2.0)
     structure_sl = min(levels["swing_low"], levels["prev_low"]) - buffer
     risk = round(entry - structure_sl, 2)
@@ -1062,7 +944,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
 
     if structure_sl <= 0 or structure_sl >= entry:
         return {"bias": "NO TRADE", "confidence": score, "reason": "invalid structure SL"}
-
     if risk_pct > MAX_RISK_PCT:
         return {
             "bias": "NO TRADE",
@@ -1070,9 +951,8 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "entry": round(entry, 2),
             "sl": round(structure_sl, 2),
             "risk_pct": round(risk_pct, 2),
-            "reason": f"risk too wide for option buying >{MAX_RISK_PCT}%"
+            "reason": f"risk too wide for option buying >{MAX_RISK_PCT}%",
         }
-
     if risk_pct < MIN_RISK_PCT:
         return {
             "bias": "NO TRADE",
@@ -1080,7 +960,7 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "entry": round(entry, 2),
             "sl": round(structure_sl, 2),
             "risk_pct": round(risk_pct, 2),
-            "reason": "risk too tight / noise SL"
+            "reason": "risk too tight / noise SL",
         }
 
     t1 = round(entry + risk * 1.5, 2)
@@ -1090,7 +970,6 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     if not (structure_sl < entry < t1 < t2 < t3):
         return {"bias": "NO TRADE", "confidence": score, "reason": "RR structure invalid"}
 
-    # Reject unrealistic targets where T1 is too far above option day high.
     day_high = max(c["high"] for c in candles)
     if t1 > day_high * 1.08:
         return {
@@ -1099,10 +978,9 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "entry": round(entry, 2),
             "target_t1": t1,
             "day_high": round(day_high, 2),
-            "reason": "target too far above current option day high / RR unrealistic"
+            "reason": "target too far above current option day high / RR unrealistic",
         }
 
-    # Confidence cap based on index quality. Prevents 95% confidence from option candle alone.
     raw_score = score
     if idx_score < 70:
         confidence = min(raw_score, 75)
@@ -1119,7 +997,7 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "index_score": idx_score,
             "pattern": pattern,
             "candle": cq,
-            "reason": f"RIGA sniper score below {CONFIDENCE_MIN}"
+            "reason": f"RIGA sniper score below {CONFIDENCE_MIN}",
         }
 
     return {
@@ -1169,17 +1047,7 @@ def select_best_trade(trades):
 # Core scan functions
 # -----------------------------
 
-
 def build_index_candle_fallback_bias(index: str, spot_data: Dict[str, Any], candles: List[Dict[str, Any]], freshness_reason: str) -> Dict[str, Any]:
-    """
-    Premium-led fallback for live market when index candles are missing/stale.
-
-    Purpose:
-    - Do not block the full scanner only because Angel index historical candles failed.
-    - Scan only ATM/near-ATM CE/PE.
-    - Final trade is still allowed ONLY if option premium gives breakout/retest/higher-low confirmation
-      with confidence >= CONFIDENCE_MIN and valid structure-based RR.
-    """
     ltp = spot_data.get("ltp")
     close = spot_data.get("close")
     transition_sides = ["CE", "PE"]
@@ -1190,7 +1058,6 @@ def build_index_candle_fallback_bias(index: str, spot_data: Dict[str, Any], cand
         chg = pct_change(float(ltp), float(close))
         direction_note = f"spot vs previous close {round(chg, 2)}%"
 
-        # Prefer one side when spot move is clearly directional, but keep it premium-led.
         if chg >= 0.12:
             transition_sides = ["CE"]
             score = 45 if chg < 0.40 else 50
@@ -1212,10 +1079,7 @@ def build_index_candle_fallback_bias(index: str, spot_data: Dict[str, Any], cand
         "transition_sides": transition_sides,
         "fallback_mode": True,
         "freshness_reason": freshness_reason,
-        "reason": (
-            f"index candles unavailable/stale ({freshness_reason}); "
-            f"{direction_note}; premium-led ATM/near-ATM option scan enabled"
-        ),
+        "reason": f"index candles unavailable/stale ({freshness_reason}); {direction_note}; premium-led ATM/near-ATM option scan enabled",
         "index": index,
     }
 
@@ -1236,10 +1100,9 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 
     hist_token = spot_item.get("hist_token", spot_item["symboltoken"])
     index_candles = get_candles(client, spot_item["exchange"], hist_token, interval=interval)
-
     fresh, freshness_reason = is_candle_data_fresh(index_candles)
-    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
 
+    atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
     total_options_found = len(options)
     option_debug_summary = {
         "total_options_found": total_options_found,
@@ -1253,8 +1116,6 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 
     if not fresh:
         session = market_session_status()
-
-        # Do not scan outside live market. This prevents stale previous-session trades.
         if not session["is_open"]:
             return {
                 "index": index,
@@ -1278,9 +1139,6 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
                 "trade_count": 0,
                 "best_trade": "NO TRADE",
             }
-
-        # Live-market fallback: index candles failed/stale, but option candles may still be valid.
-        # Scan ATM/near-ATM option premium and let option structure decide.
         index_bias = build_index_candle_fallback_bias(index, spot_data, index_candles, freshness_reason)
     else:
         index_bias = analyze_index_structure(index, spot_data, index_candles)
@@ -1288,15 +1146,12 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         index_bias["freshness_reason"] = freshness_reason
 
     index_bias["index"] = index
-
     side = index_bias.get("option_side")
     transition_sides = index_bias.get("transition_sides", []) if index_bias.get("transition_scan") else []
 
     if side in ["CE", "PE"]:
         sides_to_scan = [side]
     elif transition_sides:
-        # During transition, scan only ATM/near-ATM strikes for the stronger side(s).
-        # Final trade still requires option premium breakout/hold and confidence >= CONFIDENCE_MIN.
         sides_to_scan = transition_sides
     else:
         return {
@@ -1313,7 +1168,6 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             "reason": "index neutral, option scan skipped",
         }
 
-    # Keep RIGA option buying ATM-first. In transition mode restrict to ATM/near-ATM only.
     max_distance = INDEX_CONFIG[index]["step"] * (TRANSITION_STRIKES_AROUND if side not in ["CE", "PE"] else MAX_SCAN_STRIKES_AROUND)
     side_options = [
         opt for opt in options
@@ -1330,14 +1184,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         symboltoken = opt.get("symboltoken")
 
         if not symboltoken:
-            rejected.append({
-                "symbol": symbol,
-                "strike": opt.get("strike"),
-                "type": opt.get("type"),
-                "reason": "NO_SYMBOL_TOKEN",
-                "confidence": 0,
-                "candle_count": 0,
-            })
+            rejected.append({"symbol": symbol, "strike": opt.get("strike"), "type": opt.get("type"), "reason": "NO_SYMBOL_TOKEN", "confidence": 0, "candle_count": 0})
             continue
 
         option_debug_summary["ltp_checked"] += 1
@@ -1359,10 +1206,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         if effective_index_bias.get("option_side") not in ["CE", "PE"]:
             effective_index_bias["forced_option_side"] = opt.get("type")
             effective_index_bias["bias"] = "BULLISH" if opt.get("type") == "CE" else "BEARISH"
-            effective_index_bias["reason"] = (
-                f"transition scan; option premium confirmation required; "
-                f"{effective_index_bias.get('reason', '')}"
-            )
+            effective_index_bias["reason"] = f"transition scan; option premium confirmation required; {effective_index_bias.get('reason', '')}"
 
         signal = analyze_option_buy_setup(effective_index_bias, opt, ltp_data, opt_candles, atm, index)
 
@@ -1386,7 +1230,6 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             })
 
     best_trade = select_best_trade(trades)
-
     out = {
         "index": index,
         "spot_ltp": spot_data["ltp"],
@@ -1408,9 +1251,8 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     return out
 
 
-
 # -----------------------------
-# Request Models for ChatGPT Actions / POST body support
+# Request Models
 # -----------------------------
 
 class SpotPriceRequest(BaseModel):
@@ -1468,7 +1310,7 @@ class OptionCandleTestRequest(BaseModel):
 def root():
     return {
         "name": "RIGA AI Option Buying Scanner",
-        "version": "11.2",
+        "version": APP_VERSION,
         "status": "ok",
         "rule": "Bullish -> BUY_CE, Bearish -> BUY_PE, otherwise NO TRADE",
     }
@@ -1502,17 +1344,13 @@ def candles_test(
     token: Optional[str] = Query(None),
 ):
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
-
     client = get_client()
     item = INDEX_CONFIG[index]["spot"]
     hist_token = item.get("hist_token", item["symboltoken"])
-
     return get_candles_debug(client, item["exchange"], hist_token, interval)
-
 
 
 @app.get("/option-candles-test")
@@ -1524,14 +1362,7 @@ def option_candles_test(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    """
-    Example:
-    /option-candles-test?index=BANKNIFTY&strike=54400&side=PE&token=YOUR_TOKEN
-
-    This verifies if Angel is returning candles for that exact option token.
-    """
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
@@ -1579,11 +1410,9 @@ def get_spot_price(
     token: Optional[str] = Query(None),
 ):
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
-
     client = get_client()
     return get_ltp(client, INDEX_CONFIG[index]["spot"])
 
@@ -1606,19 +1435,16 @@ def get_option_chain(
     token: Optional[str] = Query(None),
 ):
     check_token(authorization, token)
-
     index = index.upper()
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
 
     client = get_client()
     spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
-
     if not spot_data:
         raise HTTPException(status_code=500, detail="Spot data failed")
 
     atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
-
     if include_premium:
         for opt in options:
             opt["premium"] = get_ltp(client, opt)
@@ -1641,17 +1467,10 @@ def option_chain_alias(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    return get_option_chain(
-        index=index,
-        strikes_around=strikes_around,
-        include_premium=include_premium,
-        authorization=authorization,
-        token=token,
-    )
+    return get_option_chain(index=index, strikes_around=strikes_around, include_premium=include_premium, authorization=authorization, token=token)
 
 
 def _premium_payload(opt: Dict[str, Any], premium: Optional[Dict[str, Any]], atm: int) -> Dict[str, Any]:
-    """Compact stable option premium payload for UI/action use."""
     p = premium or {}
     ltp = p.get("ltp") if isinstance(p, dict) else None
     close = p.get("close") if isinstance(p, dict) else None
@@ -1682,32 +1501,20 @@ def _premium_payload(opt: Dict[str, Any], premium: Optional[Dict[str, Any]], atm
 
 def _market_premiums_for_index(client, index: str, strikes_around: int = 1) -> Dict[str, Any]:
     index = index.upper()
-
     if index not in INDEX_CONFIG:
-        return {
-            "status": "error",
-            "index": index,
-            "reason": "Invalid index",
-        }
+        return {"status": "error", "index": index, "reason": "Invalid index"}
 
     spot_data = get_ltp(client, INDEX_CONFIG[index]["spot"])
     if not spot_data or not safe_num(spot_data.get("ltp")):
-        return {
-            "status": "error",
-            "index": index,
-            "reason": "Spot data failed",
-        }
+        return {"status": "error", "index": index, "reason": "Spot data failed"}
 
     atm, expiry, options = get_auto_option_chain(index, float(spot_data["ltp"]), strikes_around)
-
     rows = []
     for opt in options:
         premium = get_ltp(client, opt)
         rows.append(_premium_payload(opt, premium, atm))
 
-    # ATM first, then nearest strikes; CE before PE for same strike.
     rows.sort(key=lambda x: (x["atm_distance"], x["strike"], 0 if x["type"] == "CE" else 1))
-
     atm_ce = next((x for x in rows if x["strike"] == atm and x["type"] == "CE"), None)
     atm_pe = next((x for x in rows if x["strike"] == atm and x["type"] == "PE"), None)
 
@@ -1732,18 +1539,9 @@ def market_premiums(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    """
-    Returns current spot, ATM strike and CE/PE option premium LTP.
-
-    Examples:
-    /marketPremiums?token=YOUR_TOKEN
-    /marketPremiums?index=NIFTY&strikes_around=1&token=YOUR_TOKEN
-    """
     check_token(authorization, token)
-
     client = get_client()
     strikes_around = max(0, min(int(strikes_around), 6))
-
     indexes = [index.upper()] if index else ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]
     markets = {}
 
@@ -1752,7 +1550,7 @@ def market_premiums(
 
     return {
         "status": "ok",
-        "version": "11.2",
+        "version": APP_VERSION,
         "server_time": now_ist().strftime("%Y-%m-%d %H:%M:%S IST"),
         "market_session": market_session_status(),
         "strikes_around": strikes_around,
@@ -1767,12 +1565,7 @@ def market_premiums_alias(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    return market_premiums(
-        index=index,
-        strikes_around=strikes_around,
-        authorization=authorization,
-        token=token,
-    )
+    return market_premiums(index=index, strikes_around=strikes_around, authorization=authorization, token=token)
 
 
 @app.get("/scanOptions")
@@ -1797,22 +1590,10 @@ def scan_options_alias(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    return scan_options(
-        index=index,
-        strikes_around=strikes_around,
-        interval=interval,
-        debug=debug,
-        authorization=authorization,
-        token=token,
-    )
-
+    return scan_options(index=index, strikes_around=strikes_around, interval=interval, debug=debug, authorization=authorization, token=token)
 
 
 def empty_trade_payload(reason: str = "No valid setup") -> Dict[str, Any]:
-    """
-    Stable no-trade payload.
-    Important: do not return mixed string/object types for actions/plugins.
-    """
     return {
         "trade_available": False,
         "result": "NO TRADE",
@@ -1830,9 +1611,6 @@ def empty_trade_payload(reason: str = "No valid setup") -> Dict[str, Any]:
 
 
 def trade_to_payload(trade: Any) -> Dict[str, Any]:
-    """
-    Convert internal raw trade object into one stable flat schema.
-    """
     if not isinstance(trade, dict):
         return empty_trade_payload()
 
@@ -1878,19 +1656,12 @@ def scan_all_markets(
     token: Optional[str] = Query(None),
 ):
     check_token(authorization, token)
-
     markets: Dict[str, Any] = {}
     valid_trades: List[Dict[str, Any]] = []
 
     for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
         try:
-            res = scan_one_index(
-                index=idx,
-                strikes_around=strikes_around,
-                interval=interval,
-                debug=debug,
-            )
-
+            res = scan_one_index(index=idx, strikes_around=strikes_around, interval=interval, debug=debug)
             raw_best = res.get("best_trade")
             best_payload = trade_to_payload(raw_best)
 
@@ -1917,7 +1688,6 @@ def scan_all_markets(
                 "options_with_insufficient_candles": res.get("options_with_insufficient_candles"),
                 "total_options_scanned": res.get("total_options_scanned"),
                 "trade_count": res.get("trade_count"),
-                # Stable object only, never string.
                 "best_trade": best_payload,
             }
 
@@ -1952,10 +1722,9 @@ def scan_all_markets(
 
     return {
         "status": "ok",
-        "version": "11.2",
+        "version": APP_VERSION,
         "trade_available": overall_payload.get("trade_available", False),
         "result": overall_payload.get("result", "NO TRADE"),
-        # Stable object only, never string.
         "overall_best_trade": overall_payload,
         "markets": markets,
     }
@@ -1968,22 +1737,11 @@ def quick_scan(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    """
-    Lightweight endpoint for ChatGPT Actions / plugins.
-    Always returns one small stable JSON schema.
-    """
-    data = scan_all_markets(
-        strikes_around=strikes_around,
-        interval=interval,
-        debug=False,
-        authorization=authorization,
-        token=token,
-    )
-
+    data = scan_all_markets(strikes_around=strikes_around, interval=interval, debug=False, authorization=authorization, token=token)
     best = data.get("overall_best_trade") or empty_trade_payload()
     return {
         "status": data.get("status", "ok"),
-        "version": data.get("version", "11.1"),
+        "version": data.get("version", APP_VERSION),
         "trade_available": best.get("trade_available", False),
         "result": best.get("result", "NO TRADE"),
         "bias": best.get("bias"),
@@ -2008,15 +1766,7 @@ def quick_scan_text(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    """
-    Human-readable compact endpoint.
-    """
-    data = quick_scan(
-        strikes_around=strikes_around,
-        interval=interval,
-        authorization=authorization,
-        token=token,
-    )
+    data = quick_scan(strikes_around=strikes_around, interval=interval, authorization=authorization, token=token)
 
     if not data.get("trade_available"):
         return {
@@ -2057,13 +1807,7 @@ def scan_all_options_alias(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    return scan_all_markets(
-        strikes_around=strikes_around,
-        interval=interval,
-        debug=debug,
-        authorization=authorization,
-        token=token,
-    )
+    return scan_all_markets(strikes_around=strikes_around, interval=interval, debug=debug, authorization=authorization, token=token)
 
 
 @app.get("/scan_all_markets")
@@ -2073,13 +1817,7 @@ def scan_all_markets_snake_alias(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    return scan_all_markets(
-        strikes_around=strikes_around,
-        interval=interval,
-        authorization=authorization,
-        token=token,
-    )
-
+    return scan_all_markets(strikes_around=strikes_around, interval=interval, authorization=authorization, token=token)
 
 
 # -----------------------------
@@ -2087,173 +1825,78 @@ def scan_all_markets_snake_alias(
 # -----------------------------
 
 @app.post("/getSpotPrice")
-def get_spot_price_post(
-    payload: SpotPriceRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return get_spot_price(
-        index=payload.index,
-        authorization=authorization,
-        token=payload.token,
-    )
+def get_spot_price_post(payload: SpotPriceRequest, authorization: Optional[str] = Header(None)):
+    return get_spot_price(index=payload.index, authorization=authorization, token=payload.token)
 
 
 @app.post("/spot")
-def spot_alias_post(
-    payload: SpotPriceRequest,
-    authorization: Optional[str] = Header(None),
-):
+def spot_alias_post(payload: SpotPriceRequest, authorization: Optional[str] = Header(None)):
     return get_spot_price_post(payload=payload, authorization=authorization)
 
 
 @app.post("/getOptionChain")
-def get_option_chain_post(
-    payload: OptionChainRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return get_option_chain(
-        index=payload.index,
-        strikes_around=payload.strikes_around,
-        include_premium=payload.include_premium,
-        authorization=authorization,
-        token=payload.token,
-    )
+def get_option_chain_post(payload: OptionChainRequest, authorization: Optional[str] = Header(None)):
+    return get_option_chain(index=payload.index, strikes_around=payload.strikes_around, include_premium=payload.include_premium, authorization=authorization, token=payload.token)
 
 
 @app.post("/option-chain")
-def option_chain_alias_post(
-    payload: OptionChainRequest,
-    authorization: Optional[str] = Header(None),
-):
+def option_chain_alias_post(payload: OptionChainRequest, authorization: Optional[str] = Header(None)):
     return get_option_chain_post(payload=payload, authorization=authorization)
 
 
 @app.post("/marketPremiums")
-def market_premiums_post(
-    payload: MarketPremiumsRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return market_premiums(
-        index=payload.index,
-        strikes_around=payload.strikes_around,
-        authorization=authorization,
-        token=payload.token,
-    )
+def market_premiums_post(payload: MarketPremiumsRequest, authorization: Optional[str] = Header(None)):
+    return market_premiums(index=payload.index, strikes_around=payload.strikes_around, authorization=authorization, token=payload.token)
 
 
 @app.post("/market-premiums")
-def market_premiums_alias_post(
-    payload: MarketPremiumsRequest,
-    authorization: Optional[str] = Header(None),
-):
+def market_premiums_alias_post(payload: MarketPremiumsRequest, authorization: Optional[str] = Header(None)):
     return market_premiums_post(payload=payload, authorization=authorization)
 
 
 @app.post("/scanOptions")
-def scan_options_post(
-    payload: ScanOptionsRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return scan_options(
-        index=payload.index,
-        strikes_around=payload.strikes_around,
-        interval=payload.interval,
-        debug=payload.debug,
-        authorization=authorization,
-        token=payload.token,
-    )
+def scan_options_post(payload: ScanOptionsRequest, authorization: Optional[str] = Header(None)):
+    return scan_options(index=payload.index, strikes_around=payload.strikes_around, interval=payload.interval, debug=payload.debug, authorization=authorization, token=payload.token)
 
 
 @app.post("/scan-options")
-def scan_options_alias_post(
-    payload: ScanOptionsRequest,
-    authorization: Optional[str] = Header(None),
-):
+def scan_options_alias_post(payload: ScanOptionsRequest, authorization: Optional[str] = Header(None)):
     return scan_options_post(payload=payload, authorization=authorization)
 
 
 @app.post("/scanAllMarkets")
-def scan_all_markets_post(
-    payload: ScanAllMarketsRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return scan_all_markets(
-        strikes_around=payload.strikes_around,
-        interval=payload.interval,
-        debug=payload.debug,
-        authorization=authorization,
-        token=payload.token,
-    )
+def scan_all_markets_post(payload: ScanAllMarketsRequest, authorization: Optional[str] = Header(None)):
+    return scan_all_markets(strikes_around=payload.strikes_around, interval=payload.interval, debug=payload.debug, authorization=authorization, token=payload.token)
 
 
 @app.post("/scan-all-options")
-def scan_all_options_alias_post(
-    payload: ScanAllMarketsRequest,
-    authorization: Optional[str] = Header(None),
-):
+def scan_all_options_alias_post(payload: ScanAllMarketsRequest, authorization: Optional[str] = Header(None)):
     return scan_all_markets_post(payload=payload, authorization=authorization)
 
 
 @app.post("/scan_all_markets")
-def scan_all_markets_snake_alias_post(
-    payload: ScanAllMarketsRequest,
-    authorization: Optional[str] = Header(None),
-):
+def scan_all_markets_snake_alias_post(payload: ScanAllMarketsRequest, authorization: Optional[str] = Header(None)):
     return scan_all_markets_post(payload=payload, authorization=authorization)
 
 
 @app.post("/quickScan")
-def quick_scan_post(
-    payload: ScanAllMarketsRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return quick_scan(
-        strikes_around=payload.strikes_around,
-        interval=payload.interval,
-        authorization=authorization,
-        token=payload.token,
-    )
+def quick_scan_post(payload: ScanAllMarketsRequest, authorization: Optional[str] = Header(None)):
+    return quick_scan(strikes_around=payload.strikes_around, interval=payload.interval, authorization=authorization, token=payload.token)
 
 
 @app.post("/quickScanText")
-def quick_scan_text_post(
-    payload: ScanAllMarketsRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return quick_scan_text(
-        strikes_around=payload.strikes_around,
-        interval=payload.interval,
-        authorization=authorization,
-        token=payload.token,
-    )
+def quick_scan_text_post(payload: ScanAllMarketsRequest, authorization: Optional[str] = Header(None)):
+    return quick_scan_text(strikes_around=payload.strikes_around, interval=payload.interval, authorization=authorization, token=payload.token)
 
 
 @app.post("/candles-test")
-def candles_test_post(
-    payload: CandleTestRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return candles_test(
-        index=payload.index,
-        interval=payload.interval,
-        authorization=authorization,
-        token=payload.token,
-    )
+def candles_test_post(payload: CandleTestRequest, authorization: Optional[str] = Header(None)):
+    return candles_test(index=payload.index, interval=payload.interval, authorization=authorization, token=payload.token)
 
 
 @app.post("/option-candles-test")
-def option_candles_test_post(
-    payload: OptionCandleTestRequest,
-    authorization: Optional[str] = Header(None),
-):
-    return option_candles_test(
-        index=payload.index,
-        strike=payload.strike,
-        side=payload.side,
-        interval=payload.interval,
-        authorization=authorization,
-        token=payload.token,
-    )
+def option_candles_test_post(payload: OptionCandleTestRequest, authorization: Optional[str] = Header(None)):
+    return option_candles_test(index=payload.index, strike=payload.strike, side=payload.side, interval=payload.interval, authorization=authorization, token=payload.token)
 
 
 # -----------------------------
@@ -2287,4 +1930,4 @@ def format_riga_output(trade: Any) -> str:
 
 
 if __name__ == "__main__":
-    print("RIGA AI main.py v11.1 loaded. Run with: uvicorn main:app --reload")
+    print("RIGA AI main.py v11.2 loaded. Run with: uvicorn main:app --reload")
