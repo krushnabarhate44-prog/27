@@ -3,7 +3,7 @@
   "info": {
     "title": "RIGA AI Option Buying Scanner",
     "version": "11.2.0",
-    "description": "RIGA AI compact option-buying scanner with market premium table. Bullish setup returns BUY CE, bearish setup returns BUY PE, otherwise NO TRADE."
+    "description": "RIGA AI compact option-buying scanner. Bullish setup returns BUY CE, bearish setup returns BUY PE, otherwise NO TRADE."
   },
   "servers": [
     {
@@ -17,7 +17,48 @@
         "summary": "Check backend health",
         "responses": {
           "200": {
-            "description": "Backend health response"
+            "description": "Backend health response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "server_time": {
+                      "type": "string"
+                    },
+                    "market_session": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string"
+                        },
+                        "is_open": {
+                          "type": "boolean"
+                        },
+                        "server_time_ist": {
+                          "type": "string"
+                        },
+                        "today_open_ist": {
+                          "type": "string"
+                        },
+                        "today_close_ist": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "routes": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -64,7 +105,75 @@
         ],
         "responses": {
           "200": {
-            "description": "Compact final scan result"
+            "description": "Compact final scan result",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "trade_available": {
+                      "type": "boolean"
+                    },
+                    "result": {
+                      "type": "string"
+                    },
+                    "bias": {
+                      "type": ["string", "null"]
+                    },
+                    "option_trade": {
+                      "type": ["string", "null"]
+                    },
+                    "index": {
+                      "type": ["string", "null"]
+                    },
+                    "symbol": {
+                      "type": ["string", "null"]
+                    },
+                    "strike": {
+                      "type": ["integer", "null"]
+                    },
+                    "option_type": {
+                      "type": ["string", "null"]
+                    },
+                    "expiry": {
+                      "type": ["string", "null"]
+                    },
+                    "entry": {
+                      "type": ["number", "null"]
+                    },
+                    "sl": {
+                      "type": ["number", "null"]
+                    },
+                    "targets": {
+                      "type": ["object", "null"],
+                      "properties": {
+                        "t1": {
+                          "type": ["number", "null"]
+                        },
+                        "t2": {
+                          "type": ["number", "null"]
+                        },
+                        "t3": {
+                          "type": ["number", "null"]
+                        }
+                      }
+                    },
+                    "confidence": {
+                      "type": ["number", "null"]
+                    },
+                    "reason": {
+                      "type": ["string", "null"]
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -73,7 +182,7 @@
       "get": {
         "operationId": "marketPremiums",
         "summary": "Get market index ATM option premiums",
-        "description": "Returns spot, ATM strike, ATM CE/PE premiums and nearby option premiums for NIFTY, BANKNIFTY, FINNIFTY and SENSEX.",
+        "description": "Returns spot, ATM strike, ATM CE/PE premiums and nearby option premiums. For full market, do not send index parameter.",
         "parameters": [
           {
             "name": "index",
@@ -82,13 +191,11 @@
             "schema": {
               "type": "string",
               "enum": [
-                "ALL",
                 "NIFTY",
                 "BANKNIFTY",
                 "FINNIFTY",
                 "SENSEX"
-              ],
-              "default": "ALL"
+              ]
             }
           },
           {
@@ -111,7 +218,49 @@
         ],
         "responses": {
           "200": {
-            "description": "Market premium table"
+            "description": "Market premium table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    },
+                    "version": {
+                      "type": "string"
+                    },
+                    "server_time": {
+                      "type": "string"
+                    },
+                    "strikes_around": {
+                      "type": "integer"
+                    },
+                    "markets": {
+                      "type": "object",
+                      "properties": {
+                        "NIFTY": {
+                          "type": "object",
+                          "properties": {}
+                        },
+                        "BANKNIFTY": {
+                          "type": "object",
+                          "properties": {}
+                        },
+                        "FINNIFTY": {
+                          "type": "object",
+                          "properties": {}
+                        },
+                        "SENSEX": {
+                          "type": "object",
+                          "properties": {}
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -146,7 +295,40 @@
         ],
         "responses": {
           "200": {
-            "description": "Spot response"
+            "description": "Spot response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "symbol": {
+                      "type": ["string", "null"]
+                    },
+                    "exchange": {
+                      "type": ["string", "null"]
+                    },
+                    "token": {
+                      "type": ["string", "null"]
+                    },
+                    "ltp": {
+                      "type": ["number", "null"]
+                    },
+                    "open": {
+                      "type": ["number", "null"]
+                    },
+                    "high": {
+                      "type": ["number", "null"]
+                    },
+                    "low": {
+                      "type": ["number", "null"]
+                    },
+                    "close": {
+                      "type": ["number", "null"]
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
