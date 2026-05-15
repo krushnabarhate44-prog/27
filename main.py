@@ -22,11 +22,12 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 import pyotp
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Query
+from pydantic import BaseModel
 from SmartApi import SmartConnect
 
 load_dotenv()
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11.1", version="11.2")
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.2", version="11.2")
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -1407,6 +1408,58 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     return out
 
 
+
+# -----------------------------
+# Request Models for ChatGPT Actions / POST body support
+# -----------------------------
+
+class SpotPriceRequest(BaseModel):
+    index: str = "NIFTY"
+    token: Optional[str] = None
+
+
+class OptionChainRequest(BaseModel):
+    index: str = "NIFTY"
+    strikes_around: int = 3
+    include_premium: bool = False
+    token: Optional[str] = None
+
+
+class ScanOptionsRequest(BaseModel):
+    index: str = "NIFTY"
+    strikes_around: int = 3
+    interval: str = "FIVE_MINUTE"
+    debug: bool = False
+    token: Optional[str] = None
+
+
+class ScanAllMarketsRequest(BaseModel):
+    strikes_around: int = 3
+    interval: str = "FIVE_MINUTE"
+    debug: bool = False
+    token: Optional[str] = None
+
+
+class MarketPremiumsRequest(BaseModel):
+    index: Optional[str] = None
+    strikes_around: int = 1
+    token: Optional[str] = None
+
+
+class CandleTestRequest(BaseModel):
+    index: str = "NIFTY"
+    interval: str = "FIVE_MINUTE"
+    token: Optional[str] = None
+
+
+class OptionCandleTestRequest(BaseModel):
+    index: str = "NIFTY"
+    strike: Optional[int] = None
+    side: Side = "CE"
+    interval: str = "FIVE_MINUTE"
+    token: Optional[str] = None
+
+
 # -----------------------------
 # API Routes
 # -----------------------------
@@ -2025,6 +2078,181 @@ def scan_all_markets_snake_alias(
         interval=interval,
         authorization=authorization,
         token=token,
+    )
+
+
+
+# -----------------------------
+# POST Routes for ChatGPT Actions / plugin body calls
+# -----------------------------
+
+@app.post("/getSpotPrice")
+def get_spot_price_post(
+    payload: SpotPriceRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return get_spot_price(
+        index=payload.index,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/spot")
+def spot_alias_post(
+    payload: SpotPriceRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return get_spot_price_post(payload=payload, authorization=authorization)
+
+
+@app.post("/getOptionChain")
+def get_option_chain_post(
+    payload: OptionChainRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return get_option_chain(
+        index=payload.index,
+        strikes_around=payload.strikes_around,
+        include_premium=payload.include_premium,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/option-chain")
+def option_chain_alias_post(
+    payload: OptionChainRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return get_option_chain_post(payload=payload, authorization=authorization)
+
+
+@app.post("/marketPremiums")
+def market_premiums_post(
+    payload: MarketPremiumsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return market_premiums(
+        index=payload.index,
+        strikes_around=payload.strikes_around,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/market-premiums")
+def market_premiums_alias_post(
+    payload: MarketPremiumsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return market_premiums_post(payload=payload, authorization=authorization)
+
+
+@app.post("/scanOptions")
+def scan_options_post(
+    payload: ScanOptionsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return scan_options(
+        index=payload.index,
+        strikes_around=payload.strikes_around,
+        interval=payload.interval,
+        debug=payload.debug,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/scan-options")
+def scan_options_alias_post(
+    payload: ScanOptionsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return scan_options_post(payload=payload, authorization=authorization)
+
+
+@app.post("/scanAllMarkets")
+def scan_all_markets_post(
+    payload: ScanAllMarketsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return scan_all_markets(
+        strikes_around=payload.strikes_around,
+        interval=payload.interval,
+        debug=payload.debug,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/scan-all-options")
+def scan_all_options_alias_post(
+    payload: ScanAllMarketsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return scan_all_markets_post(payload=payload, authorization=authorization)
+
+
+@app.post("/scan_all_markets")
+def scan_all_markets_snake_alias_post(
+    payload: ScanAllMarketsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return scan_all_markets_post(payload=payload, authorization=authorization)
+
+
+@app.post("/quickScan")
+def quick_scan_post(
+    payload: ScanAllMarketsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return quick_scan(
+        strikes_around=payload.strikes_around,
+        interval=payload.interval,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/quickScanText")
+def quick_scan_text_post(
+    payload: ScanAllMarketsRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return quick_scan_text(
+        strikes_around=payload.strikes_around,
+        interval=payload.interval,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/candles-test")
+def candles_test_post(
+    payload: CandleTestRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return candles_test(
+        index=payload.index,
+        interval=payload.interval,
+        authorization=authorization,
+        token=payload.token,
+    )
+
+
+@app.post("/option-candles-test")
+def option_candles_test_post(
+    payload: OptionCandleTestRequest,
+    authorization: Optional[str] = Header(None),
+):
+    return option_candles_test(
+        index=payload.index,
+        strike=payload.strike,
+        side=payload.side,
+        interval=payload.interval,
+        authorization=authorization,
+        token=payload.token,
     )
 
 
