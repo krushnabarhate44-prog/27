@@ -1333,6 +1333,7 @@ def health():
             "/scanAllMarkets",
             "/quickScan",
             "/quickScanText",
+            "/rigaScan",
             "/candles-test",
             "/option-candles-test",
         ],
@@ -1800,6 +1801,63 @@ def quick_scan_text(
             f"Reason: {data.get('reason')}"
         )
     }
+
+
+@app.get("/rigaScan")
+def riga_scan_simple(
+    token: Optional[str] = Query(None),
+    strikes_around: int = Query(3),
+    interval: str = Query("FIVE_MINUTE"),
+    authorization: Optional[str] = Header(None),
+):
+    check_token(authorization, token)
+
+    data = quick_scan(
+        strikes_around=strikes_around,
+        interval=interval,
+        authorization=authorization,
+        token=token,
+    )
+
+    if not data.get("trade_available"):
+        return {
+            "text": (
+                "NO TRADE\n\n"
+                "Market:\n"
+                "Bias: Bullish / Bearish not confirmed\n"
+                "Option Trade: NO TRADE\n"
+                "Strike: —\n"
+                "Entry: —\n"
+                "Stop Loss: —\n"
+                "Target: —\n"
+                f"Confidence: {data.get('confidence', 0)}%\n"
+                f"Reason: {data.get('reason') or 'No valid setup'}"
+            )
+        }
+
+    return {
+        "text": (
+            "Market:\n"
+            f"Bias: {data.get('bias')}\n"
+            f"Option Trade: {data.get('option_trade')}\n"
+            f"Strike: {data.get('symbol') or data.get('strike')}\n"
+            f"Entry: {data.get('entry')}\n"
+            f"Stop Loss: {data.get('sl')}\n"
+            f"Target: {data.get('targets')}\n"
+            f"Confidence: {data.get('confidence')}%\n"
+            f"Reason: {data.get('reason')}"
+        )
+    }
+
+
+@app.post("/rigaScan")
+def riga_scan_simple_post(payload: ScanAllMarketsRequest, authorization: Optional[str] = Header(None)):
+    return riga_scan_simple(
+        token=payload.token,
+        strikes_around=payload.strikes_around,
+        interval=payload.interval,
+        authorization=authorization,
+    )
 
 
 @app.get("/scan-all-options")
