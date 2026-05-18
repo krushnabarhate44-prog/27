@@ -36,11 +36,14 @@ Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
-ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
-ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
-ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD")
-ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
-RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN", "")
+# TEST ONLY fallback values.
+# Environment variables are still preferred. If Render env values exist, they will be used first.
+# Remove these fallback values after testing and rotate exposed credentials.
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY") or "SZnVKgAp"
+ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE") or "K53826802"
+ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD") or "4270"
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET") or "EPHI745NRM3RSLJ2WEWH66ISQU"
+RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN") or "Krushna123"
 
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
