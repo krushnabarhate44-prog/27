@@ -27,9 +27,9 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-APP_VERSION = "11.3-BOOK-KNOWLEDGE"
+APP_VERSION = "11.4-TRADE-FIXED"
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11.3 Book Knowledge", version=APP_VERSION)
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.4 Trade Fixed", version=APP_VERSION)
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -39,24 +39,24 @@ IST = timezone(timedelta(hours=5, minutes=30))
 # TEST ONLY fallback values.
 # Environment variables are still preferred. If Render env values exist, they will be used first.
 # Remove these fallback values after testing and rotate exposed credentials.
-ANGEL_API_KEY = os.getenv("ANGEL_API_KEY") or "SZnVKgAp"
-ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE") or "K53826802"
-ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD") or "4270"
-ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET") or "EPHI745NRM3RSLJ2WEWH66ISQU"
-RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN") or "Krushna123"
+ANGEL_API_KEY = os.getenv("ANGEL_API_KEY")
+ANGEL_CLIENT_CODE = os.getenv("ANGEL_CLIENT_CODE")
+ANGEL_PASSWORD = os.getenv("ANGEL_PASSWORD")
+ANGEL_TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET")
+RIGA_ACTION_TOKEN = os.getenv("RIGA_ACTION_TOKEN")
 
 SCRIP_MASTER_URL = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
 
-CONFIDENCE_MIN = 75
-MAX_RISK_PCT = 8.0
-MIN_RISK_PCT = 2.0
+CONFIDENCE_MIN = 70
+MAX_RISK_PCT = 10.0
+MIN_RISK_PCT = 1.0
 DEFAULT_BUFFER_PCT = 0.015
 MIN_CANDLES = 8
 
 TRANSITION_SCAN_MIN_SCORE = 45
 TRANSITION_STRIKES_AROUND = 1
 MAX_SCAN_STRIKES_AROUND = 3
-PREMIUM_LED_SCAN_ALWAYS = False
+PREMIUM_LED_SCAN_ALWAYS = True
 
 client_obj = None
 scrip_master_cache = None
@@ -1221,8 +1221,10 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     entry = float(ltp_data["ltp"])
     last_close = float(last["close"])
 
+    # Live option premiums move fast. Keep a chase guard, but do not reject
+    # valid setups for tiny LTP/candle-close mismatch.
     ltp_distance_pct = abs(entry - last_close) / last_close * 100 if last_close else 999
-    if ltp_distance_pct > 1.2:
+    if ltp_distance_pct > 2.0:
         return {
             "bias": "NO TRADE",
             "confidence": 0,
@@ -1310,28 +1312,40 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "candle_count": len(candles),
         }
 
+    # OPTION PREMIUM EXECUTION FILTER
+    # For both BUY CE and BUY PE, option premium itself must show bullish strength.
+    # This accepts only ATM/near-ATM option premium support/retest/throwback holds.
     retest_candidates = []
     if vwap:
-        retest_candidates.append(("VWAP", float(vwap)))
+        retest_candidates.append(("VWAP_RETEST_HOLD", float(vwap)))
     if levels.get("prev_high"):
-        retest_candidates.append(("PREV_SWING_HIGH", float(levels["prev_high"])))
+        retest_candidates.append(("PREV_SWING_HIGH_THROWBACK", float(levels["prev_high"])))
+    if levels.get("prev_low"):
+        retest_candidates.append(("PREV_SWING_LOW_SUPPORT", float(levels["prev_low"])))
+    if levels.get("swing_low"):
+        retest_candidates.append(("RECENT_SWING_LOW_SUPPORT", float(levels["swing_low"])))
 
     retest_level_name = None
     retest_level = None
     for name, level in retest_candidates:
         if level <= 0:
             continue
-        tolerance = 0.006
-        held_level = (
-            last["low"] <= level * (1 + tolerance)
-            and last["close"] > level
-            and is_bull_candle(last)
-            and (
-                lower_wick(last) >= body * 0.35
-                or last["close"] > prev["high"]
-                or candle_position(last) >= 0.70
-            )
+
+        # Slightly wider tolerance because option premiums have spread/noise.
+        tolerance = 0.010
+
+        touched_or_swept = last["low"] <= level * (1 + tolerance)
+        reclaimed = last["close"] >= level
+        bullish_acceptance = (
+            is_bull_candle(last)
+            or last["close"] > prev["high"]
+            or candle_position(last) >= 0.65
+            or lower_wick(last) >= body * 0.25
         )
+
+        # Avoid accepting a close far below the retest level.
+        held_level = touched_or_swept and reclaimed and bullish_acceptance
+
         if held_level:
             retest_level_name = name
             retest_level = level
@@ -1341,15 +1355,19 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         return {
             "bias": "NO TRADE",
             "confidence": score,
-            "reason": "no retest/throwback hold on option premium",
+            "reason": "no support/retest/throwback hold on ATM/near-ATM option premium",
             "premium_vwap": round(vwap, 2) if vwap else None,
             "prev_swing_high": round(levels.get("prev_high"), 2) if levels.get("prev_high") else None,
+            "prev_swing_low": round(levels.get("prev_low"), 2) if levels.get("prev_low") else None,
+            "recent_swing_low": round(levels.get("swing_low"), 2) if levels.get("swing_low") else None,
+            "last_low": round(last["low"], 2),
+            "last_close": round(last["close"], 2),
             "candle_count": len(candles),
         }
 
     pattern = "PREMIUM_RETEST_HOLD"
     score += 30
-    reasons.append(f"premium retest/throwback hold at {retest_level_name}")
+    reasons.append(f"ATM/near-ATM option premium support/retest hold at {retest_level_name}")
 
     if vwap:
         distance_from_vwap = pct_change(entry, vwap)
@@ -1372,13 +1390,16 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     elif cq == "B_BULL":
         score += 8
         reasons.append("B bullish premium candle with retest confirmation")
+    elif candle_position(last) >= 0.65 and last["close"] >= retest_level:
+        score += 6
+        reasons.append("premium acceptance candle after retest")
     else:
         return {
             "bias": "NO TRADE",
             "confidence": score,
             "pattern": pattern,
             "candle": cq,
-            "reason": "premium candle quality not strong enough after retest",
+            "reason": "option premium candle quality not strong enough after retest/support hold",
         }
 
     if 0.15 < mom < 3.0:
@@ -1686,6 +1707,8 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         if effective_index_bias.get("option_side") not in ["CE", "PE"]:
             effective_index_bias["forced_option_side"] = opt.get("type")
             effective_index_bias["bias"] = "BULLISH" if opt.get("type") == "CE" else "BEARISH"
+            effective_index_bias["transition_scan"] = True
+            effective_index_bias["score"] = max(int(effective_index_bias.get("score", 0) or 0), TRANSITION_SCAN_MIN_SCORE)
             effective_index_bias["reason"] = f"transition scan; option premium confirmation required; {effective_index_bias.get('reason', '')}"
 
         signal = analyze_option_buy_setup(effective_index_bias, opt, ltp_data, opt_candles, atm, index)
@@ -1726,7 +1749,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     }
 
     if debug:
-        out["rejected"] = rejected[:20]
+        out["rejected"] = rejected[:50]
 
     return out
 
