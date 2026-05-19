@@ -27,9 +27,9 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-APP_VERSION = "11.4-TRADE-FIXED"
+APP_VERSION = "11.5-WATCHLIST-FIXED"
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11.4 Trade Fixed", version=APP_VERSION)
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.5 Watchlist Fixed", version=APP_VERSION)
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -57,6 +57,18 @@ TRANSITION_SCAN_MIN_SCORE = 45
 TRANSITION_STRIKES_AROUND = 1
 MAX_SCAN_STRIKES_AROUND = 3
 PREMIUM_LED_SCAN_ALWAYS = True
+
+# v11.5 safety + opportunity capture controls
+# FINNIFTY is manually blacklisted due repeated weak/loss signals in live testing.
+BLACKLISTED_INDEXES = {"FINNIFTY"}
+FINAL_REQUIRE_FRESH_INDEX = True
+DEVELOPING_MIN_CONFIDENCE = 55
+WATCHLIST_MAX_ITEMS = 8
+REJECTED_SUMMARY_MAX_ITEMS = 12
+MOMENTUM_BREAKOUT_ALLOW = True
+MOMENTUM_BREAKOUT_MAX_PREMIUM_PCT = 2.8
+CHASE_VWAP_HARD_REJECT_PCT = 5.0
+LTP_SIGNAL_DISTANCE_MAX_PCT = 2.5
 
 client_obj = None
 scrip_master_cache = None
@@ -827,7 +839,7 @@ def trade_location_filter(entry: float, candles: List[Dict[str, Any]], vwap: Opt
         if dist <= 1.8:
             score += 8
             reasons.append("near VWAP value area")
-        elif dist > 5.0:
+        elif dist > CHASE_VWAP_HARD_REJECT_PCT:
             return False, f"chase rejected: premium {round(dist,2)}% away from VWAP", score
     if levels:
         if side == "CE":
@@ -1224,14 +1236,14 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
     # Live option premiums move fast. Keep a chase guard, but do not reject
     # valid setups for tiny LTP/candle-close mismatch.
     ltp_distance_pct = abs(entry - last_close) / last_close * 100 if last_close else 999
-    if ltp_distance_pct > 2.0:
+    if ltp_distance_pct > LTP_SIGNAL_DISTANCE_MAX_PCT:
         return {
             "bias": "NO TRADE",
             "confidence": 0,
             "entry": round(entry, 2),
             "signal_close": round(last_close, 2),
             "ltp_distance_pct": round(ltp_distance_pct, 2),
-            "reason": "LTP too far from signal candle close; stale/chase entry rejected",
+            "reason": f"LTP too far from signal candle close >{LTP_SIGNAL_DISTANCE_MAX_PCT}%; stale/chase entry rejected",
             "candle_count": len(candles),
         }
 
@@ -1274,6 +1286,17 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "book_filters": book_block.get("filters"),
             "book_knowledge": book_block,
             "reason": "; ".join(book_block.get("filters", [])),
+            "candle_count": len(candles),
+        }
+
+    book_reason_text = " ".join(str(x) for x in book_block.get("reasons", []))
+    if "chase rejected" in book_reason_text.lower():
+        return {
+            "bias": "NO TRADE",
+            "confidence": max(0, score - 15),
+            "book_score": book_score,
+            "book_knowledge": book_block,
+            "reason": "premium too extended from VWAP / chase rejected; wait for pullback/retest",
             "candle_count": len(candles),
         }
 
@@ -1351,27 +1374,50 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             retest_level = level
             break
 
+    momentum_breakout = False
     if not retest_level:
-        return {
-            "bias": "NO TRADE",
-            "confidence": score,
-            "reason": "no support/retest/throwback hold on ATM/near-ATM option premium",
-            "premium_vwap": round(vwap, 2) if vwap else None,
-            "prev_swing_high": round(levels.get("prev_high"), 2) if levels.get("prev_high") else None,
-            "prev_swing_low": round(levels.get("prev_low"), 2) if levels.get("prev_low") else None,
-            "recent_swing_low": round(levels.get("swing_low"), 2) if levels.get("swing_low") else None,
-            "last_low": round(last["low"], 2),
-            "last_close": round(last["close"], 2),
-            "candle_count": len(candles),
-        }
+        breakout_ref = float(levels.get("prev_high") or 0)
+        vwap_ok = (not vwap) or last["close"] >= vwap
+        breakout_ok = (
+            MOMENTUM_BREAKOUT_ALLOW
+            and breakout_ref > 0
+            and last["close"] > breakout_ref
+            and candle_position(last) >= 0.72
+            and is_bull_candle(last)
+            and vol_ok
+            and 0.20 <= mom <= MOMENTUM_BREAKOUT_MAX_PREMIUM_PCT
+            and vwap_ok
+            and not index_bias.get("fallback_mode")
+        )
 
-    pattern = "PREMIUM_RETEST_HOLD"
-    score += 30
-    reasons.append(f"ATM/near-ATM option premium support/retest hold at {retest_level_name}")
+        if breakout_ok:
+            momentum_breakout = True
+            retest_level_name = "MOMENTUM_BREAKOUT_ABOVE_PREV_HIGH"
+            retest_level = breakout_ref
+            reasons.append("momentum breakout mode: premium breakout above previous swing high with volume")
+            score += 24
+        else:
+            return {
+                "bias": "NO TRADE",
+                "confidence": score,
+                "reason": "no support/retest/throwback hold on ATM/near-ATM option premium",
+                "premium_vwap": round(vwap, 2) if vwap else None,
+                "prev_swing_high": round(levels.get("prev_high"), 2) if levels.get("prev_high") else None,
+                "prev_swing_low": round(levels.get("prev_low"), 2) if levels.get("prev_low") else None,
+                "recent_swing_low": round(levels.get("swing_low"), 2) if levels.get("swing_low") else None,
+                "last_low": round(last["low"], 2),
+                "last_close": round(last["close"], 2),
+                "candle_count": len(candles),
+            }
+
+    pattern = "PREMIUM_BREAKOUT_MOMENTUM" if momentum_breakout else "PREMIUM_RETEST_HOLD"
+    if not momentum_breakout:
+        score += 30
+        reasons.append(f"ATM/near-ATM option premium support/retest hold at {retest_level_name}")
 
     if vwap:
         distance_from_vwap = pct_change(entry, vwap)
-        if distance_from_vwap > 5.0:
+        if distance_from_vwap > CHASE_VWAP_HARD_REJECT_PCT:
             return {
                 "bias": "NO TRADE",
                 "confidence": score,
@@ -1494,6 +1540,20 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "reason": f"RIGA sniper score below {CONFIDENCE_MIN}",
         }
 
+    if FINAL_REQUIRE_FRESH_INDEX and index_bias.get("fallback_mode"):
+        return {
+            "bias": "NO TRADE",
+            "confidence": min(confidence, 69),
+            "raw_score": raw_score,
+            "index_score": idx_score,
+            "pattern": pattern,
+            "candle": cq,
+            "entry": round(entry, 2),
+            "sl": round(structure_sl, 2),
+            "targets": {"t1": t1, "t2": t2, "t3": t3},
+            "reason": "final trade rejected because index candles are stale/unavailable; keep as watchlist only",
+        }
+
     return {
         "bias": "BUY_CE" if side == "CE" else "BUY_PE",
         "entry": round(entry, 2),
@@ -1528,6 +1588,150 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         "reason": ", ".join([r for r in reasons if r]),
     }
 
+
+
+def make_watchlist_candidate(index_name: str, opt: Dict[str, Any], ltp_data: Optional[Dict[str, Any]], candles: List[Dict[str, Any]], atm: int, index_bias: Dict[str, Any], signal: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Create a developing setup so fast markets do not look like plain NO TRADE.
+
+    This is NOT a final trade. It gives trigger/retest/SL levels to watch.
+    Final trade still requires /quickScan or /rigaScan confirmed BUY_CE/BUY_PE.
+    """
+    if index_name in BLACKLISTED_INDEXES:
+        return None
+    if not ltp_data or not safe_num(ltp_data.get("ltp")):
+        return None
+    if not candles or len(candles) < MIN_CANDLES:
+        return None
+
+    side = opt.get("type")
+    if side not in ["CE", "PE"]:
+        return None
+
+    levels = find_swing_levels(candles, 20)
+    if not levels:
+        return None
+
+    entry_ltp = float(ltp_data["ltp"])
+    last = candles[-1]
+    prev = candles[-2]
+    vwap = calc_vwap(candles)
+    vol_ok, vol_ratio, _ = volume_spike(candles)
+    cq = classify_candle(last)
+    mom = pct_change(last["close"], prev["close"])
+    step = INDEX_CONFIG[index_name]["step"]
+    atm_distance = abs(opt["strike"] - atm)
+
+    # Only ATM/near-ATM developing ideas.
+    if atm_distance > step:
+        return None
+
+    score = int(signal.get("confidence", 0) or 0)
+    reasons = []
+    if signal.get("reason"):
+        reasons.append(str(signal.get("reason")))
+
+    idx_score = int(index_bias.get("score", 0) or 0)
+    score = max(score, min(idx_score, 60))
+
+    if cq == "A_PLUS_BULL":
+        score += 16
+        reasons.append("developing A+ bullish premium candle")
+    elif cq == "A_BULL":
+        score += 12
+        reasons.append("developing A bullish premium candle")
+    elif cq == "B_BULL" or candle_position(last) >= 0.62:
+        score += 8
+        reasons.append("premium candle position improving")
+
+    if vwap and last["close"] >= vwap:
+        score += 8
+        reasons.append("premium above VWAP")
+    elif vwap and abs(entry_ltp - vwap) / vwap * 100 <= 2.0:
+        score += 5
+        reasons.append("premium near VWAP value area")
+
+    if vol_ok:
+        score += 8
+        reasons.append(f"volume expansion {vol_ratio}x")
+
+    if 0.05 <= mom <= 3.0:
+        score += 6
+        reasons.append(f"premium momentum {round(mom, 2)}%")
+
+    if atm_distance == 0:
+        score += 8
+        reasons.append("ATM strike")
+    else:
+        score += 5
+        reasons.append("near ATM strike")
+
+    # Trigger logic: option premium itself must break and then hold.
+    prev_high = float(levels.get("prev_high") or last["high"])
+    trigger = max(prev_high, last["high"], entry_ltp)
+    trigger = round(trigger * 1.005, 2)
+
+    retest_hold = None
+    if vwap and vwap > 0:
+        retest_hold = max(float(vwap), float(levels.get("prev_low") or 0))
+    else:
+        retest_hold = float(levels.get("prev_low") or 0)
+    retest_hold = round(retest_hold, 2) if retest_hold and retest_hold > 0 else None
+
+    buffer = max(entry_ltp * DEFAULT_BUFFER_PCT, 2.0)
+    structure_sl = min(float(levels.get("swing_low") or entry_ltp), float(levels.get("prev_low") or entry_ltp)) - buffer
+    if structure_sl <= 0 or structure_sl >= entry_ltp:
+        return None
+
+    risk = round(entry_ltp - structure_sl, 2)
+    risk_pct = (risk / entry_ltp) * 100 if entry_ltp else 999
+    if risk_pct > MAX_RISK_PCT * 1.25:
+        # Wide risk watchlist is not useful; level may be too late.
+        return None
+
+    t1 = round(entry_ltp + risk * 1.5, 2)
+    t2 = round(entry_ltp + risk * 2.0, 2)
+
+    # Developing confidence should not be presented as final confidence.
+    confidence = max(DEVELOPING_MIN_CONFIDENCE, min(int(score), 69 if signal.get("bias") != "BUY_CE" and signal.get("bias") != "BUY_PE" else 74))
+    if confidence < DEVELOPING_MIN_CONFIDENCE:
+        return None
+
+    return {
+        "index": index_name,
+        "symbol": opt.get("tradingsymbol"),
+        "strike": opt.get("strike"),
+        "option_type": side,
+        "option_trade": "BUY CE" if side == "CE" else "BUY PE",
+        "ltp": round(entry_ltp, 2),
+        "watch_entry_above": trigger,
+        "retest_hold_zone": retest_hold,
+        "sl_below": round(structure_sl, 2),
+        "targets_if_triggered": {"t1": t1, "t2": t2},
+        "confidence": confidence,
+        "atm_distance": atm_distance,
+        "premium_vwap": round(vwap, 2) if vwap else None,
+        "reason": "; ".join(reasons[:5]) if reasons else "developing premium setup; wait for breakout + retest hold",
+        "rule": "WATCHLIST ONLY: enter only after trigger breakout + retest hold; no direct chase",
+    }
+
+
+def select_best_watchlist(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+
+    def key(x: Dict[str, Any]):
+        return (
+            int(x.get("confidence", 0) or 0),
+            -int(x.get("atm_distance", 9999) or 9999),
+            float(x.get("ltp", 0) or 0),
+        )
+
+    unique = {}
+    for c in sorted(candidates, key=key, reverse=True):
+        sym = c.get("symbol")
+        if sym and sym not in unique:
+            unique[sym] = c
+    return list(unique.values())[:WATCHLIST_MAX_ITEMS]
 
 def select_best_trade(trades):
     if not trades:
@@ -1590,6 +1794,37 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 
     if index not in INDEX_CONFIG:
         raise HTTPException(status_code=400, detail="Invalid index")
+
+    if index in BLACKLISTED_INDEXES:
+        return {
+            "index": index,
+            "spot_ltp": None,
+            "spot_close": None,
+            "index_bias": {
+                "bias": "BLACKLISTED",
+                "option_side": None,
+                "score": 0,
+                "reason": f"{index} manually blacklisted after repeated weak/loss signals",
+                "index": index,
+            },
+            "atm": None,
+            "nearest_expiry": None,
+            "index_candle_fresh": False,
+            "freshness_reason": "BLACKLISTED",
+            "total_options_found": 0,
+            "side_options_found": 0,
+            "ltp_checked": 0,
+            "candle_requests": 0,
+            "options_with_candles": 0,
+            "options_without_candles": 0,
+            "options_with_insufficient_candles": 0,
+            "total_options_scanned": 0,
+            "trade_count": 0,
+            "best_trade": "NO TRADE",
+            "watchlist": [],
+            "rejected": [{"reason": f"{index} blacklisted"}],
+            "reason": f"{index} manually blacklisted",
+        }
 
     client = get_client()
     cfg = INDEX_CONFIG[index]
@@ -1677,6 +1912,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
     option_debug_summary["side_options_found"] = len(side_options)
 
     trades = []
+    watchlist_candidates = []
     rejected = []
     scanned = 0
 
@@ -1713,7 +1949,15 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
 
         signal = analyze_option_buy_setup(effective_index_bias, opt, ltp_data, opt_candles, atm, index)
 
-        if signal.get("bias") in ["BUY_CE", "BUY_PE"] and signal.get("confidence", 0) >= CONFIDENCE_MIN:
+        final_signal_ok = (
+            signal.get("bias") in ["BUY_CE", "BUY_PE"]
+            and signal.get("confidence", 0) >= CONFIDENCE_MIN
+            and not effective_index_bias.get("fallback_mode")
+            and index not in BLACKLISTED_INDEXES
+            and "chase rejected" not in str(signal.get("reason", "")).lower()
+        )
+
+        if final_signal_ok:
             trades.append({
                 "index": index,
                 "option": opt,
@@ -1721,7 +1965,12 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
                 "signal": signal,
                 "atm_distance": signal.get("atm_distance", abs(opt["strike"] - atm)),
             })
-        elif debug:
+        else:
+            candidate = make_watchlist_candidate(index, opt, ltp_data, opt_candles, atm, effective_index_bias, signal)
+            if candidate:
+                watchlist_candidates.append(candidate)
+
+            # v11.5: always keep a compact rejection summary so NO TRADE is explainable.
             rejected.append({
                 "symbol": symbol,
                 "strike": opt.get("strike"),
@@ -1733,6 +1982,7 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
             })
 
     best_trade = select_best_trade(trades)
+    watchlist = select_best_watchlist(watchlist_candidates)
     out = {
         "index": index,
         "spot_ltp": spot_data["ltp"],
@@ -1745,7 +1995,10 @@ def scan_one_index(index: str, strikes_around: int = 3, interval: str = "FIVE_MI
         **option_debug_summary,
         "total_options_scanned": scanned,
         "trade_count": len(trades),
+        "watchlist_count": len(watchlist),
         "best_trade": best_trade if best_trade else "NO TRADE",
+        "watchlist": watchlist,
+        "rejected_summary": rejected[:REJECTED_SUMMARY_MAX_ITEMS],
     }
 
     if debug:
@@ -2188,6 +2441,7 @@ def scan_all_markets(
     check_token(authorization, token)
     markets: Dict[str, Any] = {}
     valid_trades: List[Dict[str, Any]] = []
+    all_watchlist: List[Dict[str, Any]] = []
 
     for idx in ["NIFTY", "BANKNIFTY", "FINNIFTY", "SENSEX"]:
         try:
@@ -2195,8 +2449,12 @@ def scan_all_markets(
             raw_best = res.get("best_trade")
             best_payload = trade_to_payload(raw_best)
 
-            if best_payload.get("trade_available"):
+            if best_payload.get("trade_available") and idx not in BLACKLISTED_INDEXES:
                 valid_trades.append(raw_best)
+
+            for w in res.get("watchlist", []) or []:
+                if w.get("index") not in BLACKLISTED_INDEXES:
+                    all_watchlist.append(w)
 
             index_bias = res.get("index_bias") or {}
             markets[idx] = {
@@ -2218,11 +2476,14 @@ def scan_all_markets(
                 "options_with_insufficient_candles": res.get("options_with_insufficient_candles"),
                 "total_options_scanned": res.get("total_options_scanned"),
                 "trade_count": res.get("trade_count"),
+                "watchlist_count": res.get("watchlist_count", 0),
                 "best_trade": best_payload,
+                "watchlist": res.get("watchlist", []),
+                "rejected_summary": res.get("rejected_summary", []),
             }
 
             if debug and res.get("rejected"):
-                markets[idx]["rejected"] = res.get("rejected")[:10]
+                markets[idx]["rejected"] = res.get("rejected")[:20]
 
         except Exception as exc:
             markets[idx] = {
@@ -2249,6 +2510,7 @@ def scan_all_markets(
 
     raw_overall_best = select_best_trade(valid_trades)
     overall_payload = trade_to_payload(raw_overall_best)
+    overall_watchlist = select_best_watchlist(all_watchlist)
 
     return {
         "status": "ok",
@@ -2256,6 +2518,9 @@ def scan_all_markets(
         "trade_available": overall_payload.get("trade_available", False),
         "result": overall_payload.get("result", "NO TRADE"),
         "overall_best_trade": overall_payload,
+        "watchlist": overall_watchlist,
+        "watchlist_count": len(overall_watchlist),
+        "blacklisted_indexes": sorted(list(BLACKLISTED_INDEXES)),
         "markets": markets,
     }
 
@@ -2267,7 +2532,7 @@ def quick_scan(
     authorization: Optional[str] = Header(None),
     token: Optional[str] = Query(None),
 ):
-    data = scan_all_markets(strikes_around=strikes_around, interval=interval, debug=False, authorization=authorization, token=token)
+    data = scan_all_markets(strikes_around=strikes_around, interval=interval, debug=True, authorization=authorization, token=token)
     best = data.get("overall_best_trade") or empty_trade_payload()
     return {
         "status": data.get("status", "ok"),
@@ -2286,9 +2551,27 @@ def quick_scan(
         "targets": best.get("targets"),
         "confidence": best.get("confidence"),
         "reason": best.get("reason"),
+        "watchlist": data.get("watchlist", []),
+        "watchlist_count": data.get("watchlist_count", 0),
+        "blacklisted_indexes": data.get("blacklisted_indexes", []),
+        "markets": data.get("markets", {}),
     }
 
 
+
+
+def format_watchlist_text(items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return "Watchlist: —"
+    lines = ["Watchlist:"]
+    for i, w in enumerate(items[:5], 1):
+        lines.append(
+            f"{i}) {w.get('index')} {w.get('symbol')} {w.get('option_trade')} | "
+            f"LTP {w.get('ltp')} | Trigger above {w.get('watch_entry_above')} | "
+            f"Retest hold {w.get('retest_hold_zone')} | SL below {w.get('sl_below')} | "
+            f"Conf {w.get('confidence')}%"
+        )
+    return "\n".join(lines)
 @app.get("/quickScanText")
 def quick_scan_text(
     strikes_around: int = Query(3),
@@ -2310,7 +2593,8 @@ def quick_scan_text(
                 "Stop Loss: —\n"
                 "Target: —\n"
                 f"Confidence: {data.get('confidence', 0)}%\n"
-                f"Reason: {data.get('reason') or 'No valid setup'}"
+                f"Reason: {data.get('reason') or 'No valid setup'}\n\n"
+                f"{format_watchlist_text(data.get('watchlist', []))}"
             )
         }
 
@@ -2357,7 +2641,8 @@ def riga_scan_simple(
                 "Stop Loss: —\n"
                 "Target: —\n"
                 f"Confidence: {data.get('confidence', 0)}%\n"
-                f"Reason: {data.get('reason') or 'No valid setup'}"
+                f"Reason: {data.get('reason') or 'No valid setup'}\n\n"
+                f"{format_watchlist_text(data.get('watchlist', []))}"
             )
         }
 
