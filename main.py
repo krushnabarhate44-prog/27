@@ -27,9 +27,9 @@ from SmartApi import SmartConnect
 
 load_dotenv()
 
-APP_VERSION = "11.2"
+APP_VERSION = "11.3-BOOK-KNOWLEDGE"
 
-app = FastAPI(title="RIGA AI Option Buying Scanner v11.2", version=APP_VERSION)
+app = FastAPI(title="RIGA AI Option Buying Scanner v11.3 Book Knowledge", version=APP_VERSION)
 
 Side = Literal["CE", "PE"]
 Bias = Literal["BULLISH", "BEARISH", "NEUTRAL"]
@@ -505,6 +505,458 @@ def trap_filter(c):
 
 
 # -----------------------------
+# Book Knowledge Engine v11.3
+# Extracted as rule logic from uploaded trading books/PDFs.
+# Important: this is not a book text dump; it is executable knowledge:
+# candlestick context, chart-pattern activation, scalping filters,
+# trade-location/retest logic, false-breakout checks, and risk discipline.
+# -----------------------------
+
+BOOK_KNOWLEDGE_VERSION = "RIGA_BOOK_ENGINE_11.3"
+
+BOOK_KNOWLEDGE_SOURCES = {
+    "candlesticks": [
+        "Hammer / Inverted Hammer / Dragonfly Doji at support = bullish reversal context",
+        "Bullish Engulfing / Piercing / Morning Star / Bullish Kicker = bullish reversal confirmation",
+        "Bullish Marubozu / Three White Soldiers / Rising Three Methods = bullish continuation",
+        "Hanging Man / Shooting Star / Dark Cloud Cover at resistance = bearish reversal context",
+        "Bearish Engulfing / Evening Star / Bearish Kicker = bearish reversal confirmation",
+        "Bearish Marubozu / Three Black Crows / Falling Three Methods = bearish continuation",
+        "Candles are valid only with trend + level + volume/context confirmation",
+    ],
+    "patterns": [
+        "Pattern is not active until breakout/breakdown candle closes beyond level",
+        "False breakout: breakout then fast return inside range; failed breakout/trap: breakout opposite direction",
+        "Rectangles, triangles, wedges, flags, channels, double top/bottom, H&S require level confirmation",
+        "Targets are measured from pattern height; stops must sit beyond invalidation level with buffer",
+    ],
+    "scalping": [
+        "1/3/5 min focus; trend filter first; use EMA/SMA/VWAP direction with momentum confirmation",
+        "EMA trend + stochastic recovery/overbought rejection + price pullback to average = higher quality scalp",
+        "MACD/Stochastic/Bollinger rules act as support filters, never standalone trade reason",
+        "Every scalp must have SL and realistic targets; exit quickly when setup fails",
+    ],
+    "trade_location": [
+        "Best entries come from retest/throwback/pullback to VWAP, EMA, support/resistance, or breakout level",
+        "Avoid chasing far from VWAP or day range; wait for price to come to your level",
+        "Ambush/retest entries need high confluence and clear invalidation",
+    ],
+    "risk": [
+        "No forced trade; sometimes NO TRADE is best trade",
+        "Protective stop is mandatory before entry",
+        "Minimum 1:2 style reward potential preferred; avoid wide/noisy SL",
+        "Avoid emotional/FOMO/revenge trades and limit number of trades",
+    ],
+}
+
+
+def ema(values: List[float], period: int) -> Optional[float]:
+    vals = [float(v) for v in values if safe_num(v)]
+    if len(vals) < period:
+        return None
+    k = 2 / (period + 1)
+    e = sum(vals[:period]) / period
+    for v in vals[period:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def sma(values: List[float], period: int) -> Optional[float]:
+    vals = [float(v) for v in values if safe_num(v)]
+    if len(vals) < period:
+        return None
+    return sum(vals[-period:]) / period
+
+
+def calc_rsi(candles: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
+    if len(candles) < period + 1:
+        return None
+    gains, losses = [], []
+    closes = [float(c["close"]) for c in candles]
+    for i in range(-period, 0):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0))
+        losses.append(abs(min(change, 0)))
+    avg_gain = avg(gains)
+    avg_loss = avg(losses)
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def calc_stochastic(candles: List[Dict[str, Any]], period: int = 14) -> Optional[float]:
+    if len(candles) < period:
+        return None
+    recent = candles[-period:]
+    high = max(c["high"] for c in recent)
+    low = min(c["low"] for c in recent)
+    if high == low:
+        return None
+    return round(((candles[-1]["close"] - low) / (high - low)) * 100, 2)
+
+
+def calc_bollinger(candles: List[Dict[str, Any]], period: int = 20, mult: float = 2.0) -> Optional[Dict[str, float]]:
+    if len(candles) < period:
+        return None
+    closes = [float(c["close"]) for c in candles[-period:]]
+    mid = sum(closes) / period
+    var = sum((x - mid) ** 2 for x in closes) / period
+    sd = var ** 0.5
+    return {"upper": round(mid + mult * sd, 2), "middle": round(mid, 2), "lower": round(mid - mult * sd, 2)}
+
+
+def calc_macd(candles: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
+    closes = [float(c["close"]) for c in candles]
+    if len(closes) < 26:
+        return None
+    e12 = ema(closes, 12)
+    e26 = ema(closes, 26)
+    if e12 is None or e26 is None:
+        return None
+    macd_line = e12 - e26
+    # lightweight signal proxy using recent close momentum around MACD line
+    return {"macd": round(macd_line, 4), "histogram": round(macd_line, 4)}
+
+
+def near_level(price: float, level: Optional[float], tolerance_pct: float = 0.45) -> bool:
+    if not safe_num(price) or not safe_num(level) or not level:
+        return False
+    return abs(float(price) - float(level)) / float(level) * 100 <= tolerance_pct
+
+
+def detect_candlestick_patterns(candles: List[Dict[str, Any]], levels: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Detects high/medium quality candle patterns with context.
+    Returns bullish/bearish score, pattern names, and rejection context.
+    """
+    out = {"bull_score": 0, "bear_score": 0, "bullish": [], "bearish": [], "neutral": []}
+    if not candles:
+        return out
+
+    c1 = candles[-1]
+    c2 = candles[-2] if len(candles) >= 2 else None
+    c3 = candles[-3] if len(candles) >= 3 else None
+    body = max(candle_body(c1), 0.01)
+    rng = candle_range(c1)
+    pos = candle_position(c1)
+    lw = lower_wick(c1)
+    uw = upper_wick(c1)
+    strength = candle_strength(c1)
+
+    support = levels.get("prev_low") if levels else None
+    resistance = levels.get("prev_high") if levels else None
+    at_support = near_level(c1["low"], support, 0.65) or (levels and c1["low"] <= levels.get("swing_low", c1["low"]) * 1.006)
+    at_resistance = near_level(c1["high"], resistance, 0.65) or (levels and c1["high"] >= levels.get("swing_high", c1["high"]) * 0.994)
+
+    # Single-candle reversal / continuation knowledge
+    if is_bull_candle(c1) and lw >= body * 1.8 and pos >= 0.62:
+        name = "Hammer/Dragonfly rejection" if at_support else "Bullish long-lower-wick rejection"
+        out["bullish"].append(name)
+        out["bull_score"] += 14 if at_support else 8
+    if is_bear_candle(c1) and uw >= body * 1.8 and pos <= 0.38:
+        name = "Shooting Star/Hanging Man rejection" if at_resistance else "Bearish long-upper-wick rejection"
+        out["bearish"].append(name)
+        out["bear_score"] += 14 if at_resistance else 8
+    if is_bull_candle(c1) and strength >= 0.78 and uw <= body * 0.25 and lw <= body * 0.35:
+        out["bullish"].append("Bullish Marubozu momentum")
+        out["bull_score"] += 16
+    if is_bear_candle(c1) and strength >= 0.78 and uw <= body * 0.35 and lw <= body * 0.25:
+        out["bearish"].append("Bearish Marubozu momentum")
+        out["bear_score"] += 16
+
+    # Two-candle patterns
+    if c2:
+        if is_bear_candle(c2) and is_bull_candle(c1) and c1["open"] <= c2["close"] and c1["close"] >= c2["open"]:
+            out["bullish"].append("Bullish Engulfing")
+            out["bull_score"] += 18 if at_support else 12
+        if is_bull_candle(c2) and is_bear_candle(c1) and c1["open"] >= c2["close"] and c1["close"] <= c2["open"]:
+            out["bearish"].append("Bearish Engulfing")
+            out["bear_score"] += 18 if at_resistance else 12
+        if is_bear_candle(c2) and is_bull_candle(c1) and c1["close"] > (c2["open"] + c2["close"]) / 2 and c1["open"] < c2["close"]:
+            out["bullish"].append("Piercing Line")
+            out["bull_score"] += 10
+        if is_bull_candle(c2) and is_bear_candle(c1) and c1["close"] < (c2["open"] + c2["close"]) / 2 and c1["open"] > c2["close"]:
+            out["bearish"].append("Dark Cloud Cover")
+            out["bear_score"] += 12
+        if abs(c1["low"] - c2["low"]) / max(c1["low"], 0.01) * 100 <= 0.15 and is_bull_candle(c1):
+            out["bullish"].append("Tweezer Bottom")
+            out["bull_score"] += 8
+        if abs(c1["high"] - c2["high"]) / max(c1["high"], 0.01) * 100 <= 0.15 and is_bear_candle(c1):
+            out["bearish"].append("Tweezer Top")
+            out["bear_score"] += 8
+
+    # Three-candle patterns
+    if c2 and c3:
+        small_mid = candle_body(c2) <= candle_range(c2) * 0.35
+        if is_bear_candle(c3) and small_mid and is_bull_candle(c1) and c1["close"] > (c3["open"] + c3["close"]) / 2:
+            out["bullish"].append("Morning Star / Morning Doji Star")
+            out["bull_score"] += 18
+        if is_bull_candle(c3) and small_mid and is_bear_candle(c1) and c1["close"] < (c3["open"] + c3["close"]) / 2:
+            out["bearish"].append("Evening Star / Evening Doji Star")
+            out["bear_score"] += 18
+        last3 = candles[-3:]
+        if all(is_bull_candle(x) and candle_strength(x) >= 0.5 for x in last3) and c1["close"] > c2["close"] > c3["close"]:
+            out["bullish"].append("Three White Soldiers")
+            out["bull_score"] += 16
+        if all(is_bear_candle(x) and candle_strength(x) >= 0.5 for x in last3) and c1["close"] < c2["close"] < c3["close"]:
+            out["bearish"].append("Three Black Crows")
+            out["bear_score"] += 16
+
+    if not out["bullish"] and not out["bearish"]:
+        out["neutral"].append("No strong named candlestick pattern")
+    return out
+
+
+def detect_chart_patterns(candles: List[Dict[str, Any]], levels: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Lightweight executable chart-pattern recognition for live API candles."""
+    out = {"bull_score": 0, "bear_score": 0, "patterns": [], "activation": None, "target_hint": None, "invalidations": []}
+    if len(candles) < 12:
+        return out
+    recent = candles[-20:] if len(candles) >= 20 else candles
+    last = candles[-1]
+    prev = candles[-2]
+    highs = [c["high"] for c in recent]
+    lows = [c["low"] for c in recent]
+    closes = [c["close"] for c in recent]
+    resistance = max(highs[:-1]) if len(highs) > 1 else max(highs)
+    support = min(lows[:-1]) if len(lows) > 1 else min(lows)
+    height = max(resistance - support, 0.01)
+    range_pct = height / max(last["close"], 0.01) * 100
+
+    # Breakout / breakdown activation: close beyond level, not merely wick.
+    if last["close"] > resistance and prev["close"] <= resistance:
+        out["patterns"].append("Activated resistance breakout")
+        out["activation"] = "BULLISH_BREAKOUT_CLOSE"
+        out["bull_score"] += 22
+        out["target_hint"] = round(resistance + height, 2)
+        out["invalidations"].append(round(resistance, 2))
+    if last["close"] < support and prev["close"] >= support:
+        out["patterns"].append("Activated support breakdown")
+        out["activation"] = "BEARISH_BREAKDOWN_CLOSE"
+        out["bear_score"] += 22
+        out["target_hint"] = round(support - height, 2)
+        out["invalidations"].append(round(support, 2))
+
+    # Rectangle / congestion breakout context.
+    if 0.35 <= range_pct <= 4.5:
+        touches_hi = sum(1 for h in highs[:-1] if abs(h - resistance) / resistance * 100 <= 0.35)
+        touches_lo = sum(1 for l in lows[:-1] if abs(l - support) / support * 100 <= 0.35)
+        if touches_hi >= 2 and touches_lo >= 2:
+            out["patterns"].append("Rectangle / horizontal congestion")
+            if out["activation"] == "BULLISH_BREAKOUT_CLOSE":
+                out["bull_score"] += 10
+            elif out["activation"] == "BEARISH_BREAKDOWN_CLOSE":
+                out["bear_score"] += 10
+
+    # Compression: triangles/wedges often precede expansion; needs breakout close.
+    first_half = recent[:len(recent)//2]
+    second_half = recent[len(recent)//2:]
+    if first_half and second_half:
+        first_range = max(c["high"] for c in first_half) - min(c["low"] for c in first_half)
+        second_range = max(c["high"] for c in second_half) - min(c["low"] for c in second_half)
+        if first_range > 0 and second_range < first_range * 0.72:
+            out["patterns"].append("Triangle/Wedge volatility compression")
+            if out["activation"] == "BULLISH_BREAKOUT_CLOSE":
+                out["bull_score"] += 8
+            elif out["activation"] == "BEARISH_BREAKDOWN_CLOSE":
+                out["bear_score"] += 8
+
+    # Double top / bottom logic.
+    if len(recent) >= 10:
+        highs_idx = sorted(range(len(recent)), key=lambda i: recent[i]["high"], reverse=True)[:2]
+        lows_idx = sorted(range(len(recent)), key=lambda i: recent[i]["low"])[:2]
+        if len(highs_idx) == 2:
+            h1, h2 = recent[highs_idx[0]]["high"], recent[highs_idx[1]]["high"]
+            if abs(h1 - h2) / max(h1, 0.01) * 100 <= 0.35 and abs(highs_idx[0] - highs_idx[1]) >= 3:
+                out["patterns"].append("Double Top risk near resistance")
+                if is_bear_candle(last) and near_level(last["high"], max(h1, h2), 0.50):
+                    out["bear_score"] += 10
+        if len(lows_idx) == 2:
+            l1, l2 = recent[lows_idx[0]]["low"], recent[lows_idx[1]]["low"]
+            if abs(l1 - l2) / max(l1, 0.01) * 100 <= 0.35 and abs(lows_idx[0] - lows_idx[1]) >= 3:
+                out["patterns"].append("Double Bottom support base")
+                if is_bull_candle(last) and near_level(last["low"], min(l1, l2), 0.50):
+                    out["bull_score"] += 10
+
+    # Channel / flag continuation proxy.
+    if len(closes) >= 8:
+        slope = closes[-1] - closes[-8]
+        pullback_small = abs(closes[-1] - closes[-4]) < abs(closes[-4] - closes[-8]) if len(closes) >= 8 else False
+        if slope > 0 and pullback_small and last["close"] > prev["high"]:
+            out["patterns"].append("Bull flag/channel continuation trigger")
+            out["bull_score"] += 9
+        if slope < 0 and pullback_small and last["close"] < prev["low"]:
+            out["patterns"].append("Bear flag/channel continuation trigger")
+            out["bear_score"] += 9
+
+    if not out["patterns"]:
+        out["patterns"].append("No activated chart pattern")
+    return out
+
+
+def false_breakout_filter(candles: List[Dict[str, Any]], levels: Optional[Dict[str, Any]], side: str) -> Tuple[bool, str]:
+    if len(candles) < 3 or not levels:
+        return False, "no false-breakout evidence"
+    last = candles[-1]
+    prev = candles[-2]
+    resistance = levels.get("prev_high")
+    support = levels.get("prev_low")
+
+    if side == "CE" and resistance:
+        if prev["high"] > resistance and prev["close"] < resistance and last["close"] < resistance:
+            return True, "false bullish breakout returned below resistance"
+        if last["high"] > resistance and last["close"] < resistance:
+            return True, "intrabar bullish breakout failed to close above resistance"
+    if side == "PE" and support:
+        if prev["low"] < support and prev["close"] > support and last["close"] > support:
+            return True, "false bearish breakdown returned above support"
+        if last["low"] < support and last["close"] > support:
+            return True, "intrabar bearish breakdown failed to close below support"
+    return False, "no false-breakout evidence"
+
+
+def trade_location_filter(entry: float, candles: List[Dict[str, Any]], vwap: Optional[float], levels: Optional[Dict[str, Any]], side: str) -> Tuple[bool, str, int]:
+    """Book rule: negotiate entry; prefer retest/throwback near VWAP/SR, reject chase."""
+    if not candles:
+        return False, "no candles for trade-location check", 0
+    last = candles[-1]
+    score = 0
+    reasons = []
+    if vwap:
+        dist = abs(entry - vwap) / vwap * 100
+        if dist <= 1.8:
+            score += 8
+            reasons.append("near VWAP value area")
+        elif dist > 5.0:
+            return False, f"chase rejected: premium {round(dist,2)}% away from VWAP", score
+    if levels:
+        if side == "CE":
+            ref_levels = [levels.get("prev_high"), levels.get("swing_low"), vwap]
+            if any(near_level(last["low"], x, 0.75) for x in ref_levels if x):
+                score += 10
+                reasons.append("throwback/retest trade location")
+        else:
+            ref_levels = [levels.get("prev_low"), levels.get("swing_high"), vwap]
+            if any(near_level(last["high"], x, 0.75) for x in ref_levels if x):
+                score += 10
+                reasons.append("pullback/retest trade location")
+    if not reasons:
+        reasons.append("acceptable but not ideal trade location")
+    return True, ", ".join(reasons), score
+
+
+def scalping_indicator_score(candles: List[Dict[str, Any]], side: str, vwap: Optional[float]) -> Dict[str, Any]:
+    out = {"score": 0, "reasons": [], "rsi": None, "stochastic": None, "ema_fast": None, "ema_slow": None, "bollinger": None, "macd": None}
+    if len(candles) < 8:
+        return out
+    closes = [float(c["close"]) for c in candles]
+    fast = ema(closes, 5) or ema(closes, min(5, len(closes)))
+    mid = ema(closes, 9) or sma(closes, min(9, len(closes)))
+    slow = ema(closes, 21) if len(closes) >= 21 else sma(closes, min(12, len(closes)))
+    stoch = calc_stochastic(candles, min(14, len(candles)))
+    rsi = calc_rsi(candles, min(14, max(2, len(candles)-1)))
+    bb = calc_bollinger(candles, min(20, len(candles)))
+    macd = calc_macd(candles)
+    last = candles[-1]
+    out.update({"rsi": rsi, "stochastic": stoch, "ema_fast": round(fast, 2) if fast else None, "ema_slow": round(slow, 2) if slow else None, "bollinger": bb, "macd": macd})
+
+    if side == "CE":
+        if fast and slow and fast > slow and last["close"] >= fast:
+            out["score"] += 10
+            out["reasons"].append("EMA trend aligned bullish")
+        if vwap and last["close"] > vwap:
+            out["score"] += 8
+            out["reasons"].append("above VWAP intraday")
+        if stoch is not None and 20 <= stoch <= 85:
+            out["score"] += 6
+            out["reasons"].append("stochastic in bullish usable zone")
+        if rsi is not None and 45 <= rsi <= 72:
+            out["score"] += 6
+            out["reasons"].append("RSI momentum healthy")
+        if bb and last["close"] > bb["middle"] and last["close"] < bb["upper"] * 1.01:
+            out["score"] += 5
+            out["reasons"].append("Bollinger middle support/expansion")
+    else:
+        if fast and slow and fast < slow and last["close"] <= fast:
+            out["score"] += 10
+            out["reasons"].append("EMA trend aligned bearish")
+        if vwap and last["close"] < vwap:
+            out["score"] += 8
+            out["reasons"].append("below VWAP intraday")
+        if stoch is not None and 15 <= stoch <= 80:
+            out["score"] += 6
+            out["reasons"].append("stochastic in bearish usable zone")
+        if rsi is not None and 28 <= rsi <= 55:
+            out["score"] += 6
+            out["reasons"].append("RSI bearish momentum healthy")
+        if bb and last["close"] < bb["middle"] and last["close"] > bb["lower"] * 0.99:
+            out["score"] += 5
+            out["reasons"].append("Bollinger middle rejection/expansion")
+    return out
+
+
+def book_knowledge_score(candles: List[Dict[str, Any]], side: str, vwap: Optional[float], levels: Optional[Dict[str, Any]], entry: Optional[float] = None) -> Dict[str, Any]:
+    """Combines PDF/book knowledge into a single score block for RIGA."""
+    if not candles or side not in ["CE", "PE"]:
+        return {"score": 0, "reasons": [], "candles": {}, "chart": {}, "scalping": {}, "filters": []}
+
+    candle_info = detect_candlestick_patterns(candles, levels)
+    chart_info = detect_chart_patterns(candles, levels)
+    scalp_info = scalping_indicator_score(candles, side, vwap)
+    failed, fail_reason = false_breakout_filter(candles, levels, side)
+    loc_ok, loc_reason, loc_score = trade_location_filter(float(entry or candles[-1]["close"]), candles, vwap, levels, side)
+
+    score = 0
+    reasons = []
+    if side == "CE":
+        score += min(candle_info.get("bull_score", 0), 22)
+        if candle_info.get("bullish"):
+            reasons.append("candlestick: " + "; ".join(candle_info["bullish"][:3]))
+        score += min(chart_info.get("bull_score", 0), 24)
+    else:
+        score += min(candle_info.get("bear_score", 0), 22)
+        if candle_info.get("bearish"):
+            reasons.append("candlestick: " + "; ".join(candle_info["bearish"][:3]))
+        score += min(chart_info.get("bear_score", 0), 24)
+
+    if chart_info.get("activation"):
+        reasons.append("chart pattern activated: " + chart_info.get("activation"))
+    elif any("No activated" not in p for p in chart_info.get("patterns", [])):
+        reasons.append("chart context: " + "; ".join(chart_info.get("patterns", [])[:2]))
+
+    score += min(scalp_info.get("score", 0), 24)
+    if scalp_info.get("reasons"):
+        reasons.append("scalping filters: " + "; ".join(scalp_info["reasons"][:3]))
+
+    if loc_ok:
+        score += min(loc_score, 12)
+        reasons.append("trade location: " + loc_reason)
+    else:
+        score -= 20
+        reasons.append(loc_reason)
+
+    filters = []
+    if failed:
+        score -= 35
+        filters.append(fail_reason)
+        reasons.append("false breakout filter: " + fail_reason)
+
+    # If both bullish and bearish pattern scores are strong, reduce confidence: conflicting context.
+    if candle_info.get("bull_score", 0) >= 12 and candle_info.get("bear_score", 0) >= 12:
+        score -= 10
+        filters.append("conflicting bullish/bearish candlestick context")
+
+    return {
+        "score": max(0, min(int(score), 60)),
+        "reasons": reasons,
+        "candles": candle_info,
+        "chart": chart_info,
+        "scalping": scalp_info,
+        "filters": filters,
+    }
+
+
+# -----------------------------
 # Option Chain
 # -----------------------------
 
@@ -805,6 +1257,24 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
             "candle_count": len(candles),
         }
 
+    # Book/PDF knowledge engine adds named candlestick, chart-pattern, scalping,
+    # trade-location, and false-breakout intelligence without weakening RIGA rules.
+    book_block = book_knowledge_score(candles, side, vwap, levels, entry=entry)
+    book_score = int(book_block.get("score", 0) or 0)
+    if book_score > 0:
+        score += min(book_score, 35)
+        reasons.extend(book_block.get("reasons", [])[:4])
+    if book_block.get("filters"):
+        return {
+            "bias": "NO TRADE",
+            "confidence": max(0, score - 20),
+            "book_score": book_score,
+            "book_filters": book_block.get("filters"),
+            "book_knowledge": book_block,
+            "reason": "; ".join(book_block.get("filters", [])),
+            "candle_count": len(candles),
+        }
+
     cq = classify_candle(last)
     strength = candle_strength(last)
     mom = pct_change(last["close"], prev["close"])
@@ -1024,6 +1494,13 @@ def analyze_option_buy_setup(index_bias, opt, ltp_data, candles, atm, index_name
         "volume_spike": vol_ratio if vol_ok else None,
         "volume_available": vol_available,
         "atm_distance": atm_distance,
+        "book_score": book_score,
+        "book_knowledge": book_block,
+        "book_patterns": {
+            "candlestick": book_block.get("candles", {}),
+            "chart": book_block.get("chart", {}),
+            "scalping": book_block.get("scalping", {}),
+        },
         "trap_filter": "no trap",
         "candle_count": len(candles),
         "day_high": round(day_high, 2),
@@ -1334,11 +1811,35 @@ def health():
             "/quickScan",
             "/quickScanText",
             "/rigaScan",
+            "/knowledge",
             "/candles-test",
             "/option-candles-test",
         ],
     }
 
+
+
+
+@app.get("/knowledge")
+def knowledge_engine(
+    authorization: Optional[str] = Header(None),
+    token: Optional[str] = Query(None),
+):
+    check_token(authorization, token)
+    return {
+        "status": "ok",
+        "version": APP_VERSION,
+        "book_engine": BOOK_KNOWLEDGE_VERSION,
+        "knowledge_sources": BOOK_KNOWLEDGE_SOURCES,
+        "active_rules": [
+            "Pattern must activate by breakout/breakdown close",
+            "Candlestick must match context: trend + support/resistance + volume/momentum",
+            "Retest/throwback/VWAP trade location preferred",
+            "False breakout and trap rejection active",
+            "Scalping indicators are confirmation only, not standalone signals",
+            "Final output remains BUY_CE, BUY_PE, or NO TRADE",
+        ],
+    }
 
 @app.get("/candles-test")
 def candles_test(
@@ -1647,6 +2148,8 @@ def trade_to_payload(trade: Any) -> Dict[str, Any]:
         "momentum_pct": sig.get("momentum_pct"),
         "premium_vwap": sig.get("premium_vwap"),
         "atm_distance": sig.get("atm_distance"),
+        "book_score": sig.get("book_score"),
+        "book_patterns": sig.get("book_patterns"),
         "reason": sig.get("reason"),
     }
 
